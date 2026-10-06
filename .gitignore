@@ -1,5 +1,16 @@
-.venv/
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+
+# Secrets (DB credentials arrive in a later batch; never commit them)
 .env
+
+# Local data dumps
 data/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
