@@ -48,18 +48,22 @@ def inspect_raw(raw: pd.DataFrame) -> None:
         lambda col: col.map(lambda v: isinstance(v, str) and v.strip() == "")
     )
 
-    overview = pd.DataFrame({
-        "資料型別": raw.dtypes.astype(str),
-        "缺失值": raw.isna().sum(),
-        "空字串": is_blank.sum(),
-        "不重複值": raw.nunique(),
-    })
+    overview = pd.DataFrame(
+        {
+            "資料型別": raw.dtypes.astype(str),
+            "缺失值": raw.isna().sum(),
+            "空字串": is_blank.sum(),
+            "不重複值": raw.nunique(),
+        }
+    )
     print(overview.to_string())
 
     section("3. 此次回應中的重複資料")
     print(f"完全相同的資料列:          {int(raw.duplicated().sum())}")
     print(f"具有相同 sno 的資料列:     {int(raw['sno'].duplicated(keep=False).sum())}")
-    print(f"具有相同 sna（站名）的資料列: {int(raw['sna'].duplicated(keep=False).sum())}")
+    print(
+        f"具有相同 sna（站名）的資料列: {int(raw['sna'].duplicated(keep=False).sum())}"
+    )
 
     section("4. 資料清理決策的檢查依據")
     print(f"act 出現的值: {raw['act'].value_counts(dropna=False).to_dict()}")
@@ -71,19 +75,12 @@ def inspect_raw(raw: pd.DataFrame) -> None:
 
     if "mday" in raw:
         print(
-            f"mday != infoTime 的資料列: "
-            f"{int((raw['mday'] != raw['infoTime']).sum())}"
+            f"mday != infoTime 的資料列: {int((raw['mday'] != raw['infoTime']).sum())}"
         )
 
     if "infoDate" in raw:
-        mismatch = (
-            raw["infoDate"]
-            != raw["infoTime"].astype("string").str.slice(0, 10)
-        )
-        print(
-            f"infoDate != infoTime 日期的資料列: "
-            f"{int(mismatch.sum())}"
-        )
+        mismatch = raw["infoDate"] != raw["infoTime"].astype("string").str.slice(0, 10)
+        print(f"infoDate != infoTime 日期的資料列: {int(mismatch.sum())}")
 
     print(
         f"srcUpdateTime != updateTime 的資料列: "
@@ -102,10 +99,12 @@ def inspect_clean(df: pd.DataFrame) -> None:
     print(f"資料列數: {len(df)}   欄位數: {df.shape[1]}")
 
     print(
-        pd.DataFrame({
-            "資料型別": df.dtypes.astype(str),
-            "缺失值": df.isna().sum(),
-        }).to_string()
+        pd.DataFrame(
+            {
+                "資料型別": df.dtypes.astype(str),
+                "缺失值": df.isna().sum(),
+            }
+        ).to_string()
     )
 
     print()
@@ -113,19 +112,11 @@ def inspect_clean(df: pd.DataFrame) -> None:
 
     section("6. 數值檢查（只回報，不自動修正）")
 
-    counts = df[
-        ["total_spaces", "available_bikes", "available_spaces"]
-    ]
+    counts = df[["total_spaces", "available_bikes", "available_spaces"]]
 
-    print(
-        f"存在負數的資料列:                 "
-        f"{int((counts < 0).any(axis=1).sum())}"
-    )
+    print(f"存在負數的資料列:                 {int((counts < 0).any(axis=1).sum())}")
 
-    print(
-        f"total_spaces = 0 的資料列:         "
-        f"{int((df['total_spaces'] == 0).sum())}"
-    )
+    print(f"total_spaces = 0 的資料列:         {int((df['total_spaces'] == 0).sum())}")
 
     print(
         f"total_spaces = 99 的資料列:        "
@@ -143,28 +134,17 @@ def inspect_clean(df: pd.DataFrame) -> None:
         f"{int((df['available_spaces'] > df['total_spaces']).sum())}"
     )
 
-    out_of_box = (
-        ~df["latitude"].between(*LAT_RANGE)
-        | ~df["longitude"].between(*LON_RANGE)
+    out_of_box = ~df["latitude"].between(*LAT_RANGE) | ~df["longitude"].between(
+        *LON_RANGE
     )
 
-    print(
-        f"座標超出台北市檢查範圍的資料列:    "
-        f"{int(out_of_box.sum())}"
-    )
+    print(f"座標超出台北市檢查範圍的資料列:    {int(out_of_box.sum())}")
 
     # 計算 total_spaces - available_bikes - available_spaces。
     # 目前不知道這個差值實際代表什麼，因此只觀察、不自行解釋或修正。
-    diff = (
-        df["total_spaces"]
-        - df["available_bikes"]
-        - df["available_spaces"]
-    )
+    diff = df["total_spaces"] - df["available_bikes"] - df["available_spaces"]
 
-    print(
-        "total_spaces - available_bikes - available_spaces "
-        "（差值意義目前未知）："
-    )
+    print("total_spaces - available_bikes - available_spaces （差值意義目前未知）：")
 
     print(
         f"  = 0: {int((diff == 0).sum())}   "
@@ -193,11 +173,7 @@ def inspect_clean(df: pd.DataFrame) -> None:
             f"最晚: {df[col].max()}"
         )
 
-    age = (
-        (df["src_update_time"] - df["info_time"])
-        .dt.total_seconds()
-        / 60
-    )
+    age = (df["src_update_time"] - df["info_time"]).dt.total_seconds() / 60
 
     print("各站 info_time 比 src_update_time 落後多久：")
 
@@ -208,13 +184,10 @@ def inspect_clean(df: pd.DataFrame) -> None:
         f"> 1 天: {int((age > 1440).sum())}"
     )
 
-    stale = (
-        df.loc[
-            age > 10,
-            ["station_id", "station_name", "is_active", "info_time"],
-        ]
-        .sort_values("info_time")
-    )
+    stale = df.loc[
+        age > 10,
+        ["station_id", "station_name", "is_active", "info_time"],
+    ].sort_values("info_time")
 
     if len(stale):
         print("info_time 最舊的資料（最多顯示 10 筆）：")
@@ -222,12 +195,7 @@ def inspect_clean(df: pd.DataFrame) -> None:
 
     section("9. 各行政區站點數")
 
-    print(
-        df.groupby("district")
-        .size()
-        .sort_values(ascending=False)
-        .to_string()
-    )
+    print(df.groupby("district").size().sort_values(ascending=False).to_string())
 
 
 def main() -> int:
