@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+# src/ is a folder of scripts, not an installed package; let tests import from it.
+pythonpath = ["src"]
+testpaths = ["tests"]

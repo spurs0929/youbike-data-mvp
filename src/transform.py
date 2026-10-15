@@ -30,15 +30,34 @@ SOURCE_TZ = "Asia/Taipei"
 NAME_PREFIX = "YouBike2.0_"
 ACT_VALUES = {"1": True, "0": False}
 
+
 class TransformError(Exception):
-    """資料存在問題時拋出此例外，清理流程不該默認忽略資料問題。"""
+    """資料存在問題時拋出此例外，清理流程不該默認忽略資料問題。
+
+    所有「資料本身的問題」都以 TransformError 離開這個模組，
+    呼叫端只需要接一種例外。程式寫錯（bug）則不包裝，維持原本的例外類型。
+    """
+
+
+def _convert(series: pd.Series, column: str, convert):
+    """執行一次 pandas 轉換；把它因資料錯誤拋出的例外轉成 TransformError。"""
+    try:
+        return convert(series)
+    except (ValueError, TypeError) as exc:
+        raise TransformError(f"Column '{column}': {exc}") from exc
+
 
 def to_dataframe(stations: list[dict]) -> pd.DataFrame:
     """將原始資料轉換為清理後的資料格式。"""
     return clean(pd.DataFrame(stations))
 
+
 def clean(raw: pd.DataFrame) -> pd.DataFrame:
     # 1. 只保留會使用的欄位，並改成適合資料庫使用的欄位名稱。
+    #    先明確檢查必要欄位，不依賴 pandas 拋出 KeyError。
+    missing = [col for col in RENAME if col not in raw.columns]
+    if missing:
+        raise TransformError(f"Missing required columns: {missing}")
     df = raw[list(RENAME)].rename(columns=RENAME)
 
     # 2. 處理文字欄位。"string" 會讓缺失值保持為 <NA>；
@@ -53,21 +72,32 @@ def clean(raw: pd.DataFrame) -> pd.DataFrame:
     act = df["is_active"].astype("string").str.strip()
     unexpected = sorted(act[~act.isin(list(ACT_VALUES))].dropna().unique())
     if unexpected or act.isna().any():
-        raise TransformError(f"Unexpected act values: {unexpected} (missing: {int(act.isna().sum())})")
+        raise TransformError(
+            f"Unexpected act values: {unexpected} (missing: {int(act.isna().sum())})"
+        )
     df["is_active"] = act.map(ACT_VALUES).astype(bool)
 
     # 4. 處理數量欄位。Int64（大寫 I）是 pandas 支援空值的整數型別：
     #    遇到缺失值時會保留為 <NA>，而不是迫使整個欄位轉成 float。
+    #    轉換失敗（例如 "abc"、28.5）時，由 _convert 轉成 TransformError。
     for col in COUNT_COLUMNS:
-        df[col] = pd.to_numeric(df[col], errors="raise").astype("Int64")
+        df[col] = _convert(
+            df[col], col, lambda s: pd.to_numeric(s, errors="raise").astype("Int64")
+        )
 
     for col in COORD_COLUMNS:
-        df[col] = pd.to_numeric(df[col], errors="raise").astype("float64")
+        df[col] = _convert(
+            df[col], col, lambda s: pd.to_numeric(s, errors="raise").astype("float64")
+        )
 
     # 5. 處理時間。來源字串本身沒有包含時區資訊；
     #    這些時間是台灣當地時間，因此在儲存之前明確指定為台灣時區。
     for col in TIME_COLUMNS:
-        df[col] = pd.to_datetime(df[col], format=TIME_FORMAT).dt.tz_localize(SOURCE_TZ)
+        df[col] = _convert(
+            df[col],
+            col,
+            lambda s: pd.to_datetime(s, format=TIME_FORMAT).dt.tz_localize(SOURCE_TZ),
+        )
 
     # 6. 處理「同一次 API 回應」中的重複資料。
     #    完全相同的資料列可以安全移除。
@@ -77,6 +107,8 @@ def clean(raw: pd.DataFrame) -> pd.DataFrame:
     df = df.drop_duplicates()
     conflicting = df.loc[df["station_id"].duplicated(keep=False), "station_id"].unique()
     if len(conflicting):
-        raise TransformError(f"Same station_id with different values: {list(conflicting)[:10]}")
+        raise TransformError(
+            f"Same station_id with different values: {list(conflicting)[:10]}"
+        )
 
     return df.reset_index(drop=True)
