@@ -385,3 +385,73 @@ def test_seconds_until_next_slot():
 
     assert seconds_until_next_slot(960_000_015.0) == 45  # 960_000_000 是整分鐘
     assert seconds_until_next_slot(960_000_060.0) == 60  # 剛好整分鐘 → 等下一個
+
+
+# --- 最後一輪：暫存檔清理失敗、跳過統計的邊界 ------------------------------
+
+
+def test_cleanup_failure_does_not_mask_original_error(tmp_path, monkeypatch):
+    import collect
+
+    def failing_replace(src, dst):
+        raise OSError("rename failed")
+
+    def failing_unlink(self, missing_ok=False):
+        raise PermissionError("cannot delete tmp")
+
+    monkeypatch.setattr(collect.os, "replace", failing_replace)
+    monkeypatch.setattr(collect.Path, "unlink", failing_unlink)
+
+    with pytest.raises(OSError, match="rename failed"):
+        collect.write_raw(b"data", tmp_path / "raw" / "x.json.gz")
+
+
+class LateClock(FakeClock):
+    """每次 sleep 都晚醒 delay 秒，模擬排程啟動延遲。"""
+
+    def __init__(self, start, delay):
+        super().__init__(start)
+        self.delay = delay
+
+    def sleep(self, seconds):
+        super().sleep(seconds + self.delay)
+
+
+def run_with(tmp_path, clock, durations):
+    starts = []
+
+    def collect(data_dir):
+        starts.append(clock.now)
+        clock.now += durations[len(starts) - 1]
+        return ok_record()
+
+    loop(tmp_path, clock, collect, max_runs=len(durations))
+    return starts
+
+
+def test_late_start_crossing_boundary_counts_as_skipped(tmp_path, capsys):
+    # 晚 0.5 秒啟動、只跑 59.7 秒（不到一分鐘），但已跨過下一個整分鐘
+    clock = LateClock(start=960_000_010.0, delay=0.5)
+
+    starts = run_with(tmp_path, clock, durations=[59.7, 1])
+
+    assert starts[1] - starts[0] == 120
+    assert "skipped 1 slot(s)" in capsys.readouterr().err
+
+
+def test_late_start_without_crossing_boundary_skips_nothing(tmp_path, capsys):
+    clock = LateClock(start=960_000_010.0, delay=0.5)
+
+    starts = run_with(tmp_path, clock, durations=[59.4, 1])
+
+    assert starts[1] - starts[0] == 60
+    assert "skipped" not in capsys.readouterr().err
+
+
+def test_ending_exactly_on_boundary_counts_as_skipped(tmp_path, capsys):
+    clock = FakeClock(start=960_000_010.0)
+
+    starts = run_with(tmp_path, clock, durations=[60, 1])
+
+    assert starts[1] - starts[0] == 120
+    assert "skipped 1 slot(s)" in capsys.readouterr().err

@@ -76,6 +76,14 @@ python src/collect.py --loop
 
 `collect.py` 預設將資料寫入 `data/`，可用環境變數 `YOUBIKE_DATA_DIR` 指定其他位置。
 
+> **同一個資料目錄同時只能有一個 `collect.py` 在寫入。**
+> 使用 cron 時必須用 `flock -n` 包住，且不可與 `--loop` 同時執行，詳見
+> [docs/progress.md](docs/progress.md#執行規定單一寫入者)。
+>
+> ```
+> * * * * * cd /path/to/youbike-data-mvp && flock -n /tmp/youbike-collect.lock python src/collect.py >> collect.log 2>&1
+> ```
+
 ### 輸出內容
 
 ```

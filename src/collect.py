@@ -5,6 +5,9 @@
     python src/collect.py          # 擷取一次（交給 cron 等排程器每分鐘呼叫）
     python src/collect.py --loop   # 自己每分鐘擷取一次（在本機先累積資料用）
 
+同一個資料目錄同時只能有一個寫入者：cron 必須以 flock -n 包住，
+且不可與 --loop 同時執行（append_batch 的檢查與寫入不是原子操作）。
+
 每次擷取產生：
 - 原始檔：data/raw/YYYY/MM/DD/<batch_id>.json.gz（日期為 UTC）
 - 批次紀錄：data/fetch_batches.jsonl，一行一個批次
@@ -32,6 +35,7 @@ PostgreSQL 上線後再匯入資料表；在那之前先以 JSONL 暫存，
 """
 
 import argparse
+import contextlib
 import gzip
 import json
 import os
@@ -123,7 +127,8 @@ def write_raw(body: bytes, path: Path) -> None:
 
     先寫入暫存檔再改名（os.replace 為原子操作），
     排程中途被中斷時不會留下寫到一半的 .json.gz。
-    寫入或改名失敗時刪除暫存檔，再把原本的例外往外拋。
+    寫入或改名失敗時刪除暫存檔，再把原本的例外往外拋；
+    刪除暫存檔本身若也失敗，不覆蓋原本的例外（殘留的 .tmp 不會被當成原始檔）。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -133,7 +138,8 @@ def write_raw(body: bytes, path: Path) -> None:
         os.replace(tmp, path)
     except BaseException:
         # BaseException 也包含 KeyboardInterrupt，Ctrl+C 時同樣要清掉暫存檔。
-        tmp.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
         raise
 
 
@@ -238,8 +244,11 @@ def run_forever(
 
     執行規則：
     - 只在整分鐘啟動，同一時間只有一次擷取在執行（不重疊）。
-    - 單次執行超過一分鐘時，執行期間經過的整分鐘直接跳過、不補抓，
-      並在 stderr 記錄跳過幾次；結束後等到下一個整分鐘再開始。
+    - 執行期間跨越的整分鐘直接跳過、不補抓，並在 stderr 記錄跳過幾次；
+      結束後等到下一個整分鐘再開始。
+      跳過次數以「實際跨越的整分鐘邊界」計算，而非執行時間長度：
+      啟動晚了 0.5 秒、執行 59.7 秒，仍跨過了下一個整分鐘，算跳過 1 次。
+      剛好在整分鐘結束也算跨越，因為下一次會等到再下一個整分鐘。
     - 單次執行拋出任何 Exception（包含非預期的程式錯誤）都只記錄
       traceback，下一分鐘照常擷取；KeyboardInterrupt 會往外傳以便結束。
 
@@ -247,8 +256,11 @@ def run_forever(
     """
     runs = 0
     while max_runs is None or runs < max_runs:
-        sleep(seconds_until_next_slot(clock()))
-        started = clock()
+        before = clock()
+        wait = seconds_until_next_slot(before)
+        # 這次預定執行的整分鐘（以分鐘編號表示）；round 避免浮點誤差落到前一分鐘。
+        slot = round((before + wait) / INTERVAL_SECONDS)
+        sleep(wait)
         try:
             report(collect(data_dir))
         except Exception:  # noqa: BLE001 — 刻意接住所有錯誤，見 docstring
@@ -256,10 +268,10 @@ def run_forever(
             traceback.print_exc()
         runs += 1
 
-        skipped = int((clock() - started) // INTERVAL_SECONDS)
+        skipped = int(clock() // INTERVAL_SECONDS) - slot
         if skipped:
             print(
-                f"collect took longer than {INTERVAL_SECONDS}s; "
+                f"collect crossed {skipped} whole-minute boundary(ies); "
                 f"skipped {skipped} slot(s)",
                 file=sys.stderr,
             )
