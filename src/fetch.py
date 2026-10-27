@@ -8,6 +8,7 @@
 不進行資料轉換、儲存或排程。
 """
 
+import json
 import sys
 from collections import Counter
 
@@ -57,6 +58,16 @@ def fetch_stations(url: str = URL) -> list[dict]:
     - 回傳內容不是合法 JSON
     - JSON 結構不符合目前程式預期
     """
+    return parse_stations(fetch_raw(url))
+
+
+def fetch_raw(url: str = URL) -> bytes:
+    """下載原始回應內容（bytes），不做任何解析。
+
+    Batch 3 需要保存「上游實際回傳的內容」，
+    因此下載與解析拆成兩步：先拿到原始 bytes，再交給 parse_stations。
+    網路或 HTTP 錯誤會拋出 FetchError。
+    """
     try:
         response = requests.get(url, timeout=TIMEOUT)
         response.raise_for_status()  # HTTP 錯誤會拋出 requests.HTTPError
@@ -69,9 +80,14 @@ def fetch_stations(url: str = URL) -> list[dict]:
     except requests.exceptions.RequestException as e:
         raise FetchError(f"Network error: {e}") from e
 
+    return response.content
+
+
+def parse_stations(body: bytes) -> list[dict]:
+    """將原始回應內容解析為站點 dict list，並驗證基本結構。"""
     try:
-        data = response.json()
-    except ValueError as e:
+        data = json.loads(body)
+    except ValueError as e:  # 包含 JSONDecodeError 與 UnicodeDecodeError
         raise FetchError("Response body is not valid JSON") from e
 
     validate_shape(data)
