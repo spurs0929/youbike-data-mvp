@@ -1,7 +1,7 @@
 # 開發紀錄與設計決策
 
 記錄每個批次實際完成的內容、做出的設計決策與理由，以及已知限制。
-整體架構與後續規劃以「YouBike 2.0 專案設計定版 v1.0」為準，本文件只記錄已實作的部分。
+整體架構與後續規劃以「YouBike 2.0 專案設計定版 v1.1」為準，本文件只記錄已實作的部分。
 
 - 最後更新：2026-11-02
 - 測試數量：67 項（transform 28 項、collect 39 項）
@@ -186,11 +186,12 @@ transform.py  Pandas 清洗與型別轉換      （Batch 2）
 
 ## 下一步
 
-> 2026-11-02：後續規劃以《設計定版 v1.1》第十二節為準。
-> Batch 4A-1 Schema 規格見 [docs/schema.md](schema.md)，下一步為 4A-2（migration 與 PostgreSQL 驅動）。
+依《設計定版 v1.1》第十二節。Batch 4A-1 Schema 規格已完成，見 [docs/schema.md](schema.md)。
 
-1. 以真實資料執行 `collect.py --loop`，確認擷取正常。
-2. 實測每批原始檔大小，估算每日與 90 天的儲存量。
-3. 決定擷取排程的執行環境與原始檔的儲存位置（設計文件附錄 A 的 A1、A2）。
-4. 建立 PostgreSQL 資料表（`stations`、`fetch_batches`、`station_snapshots`），
-   並將 `fetch_batches.jsonl` 匯入。
+1. **4A-2**：依 `docs/schema.md` 撰寫四張表的 migration；決定 migration 工具與 PostgreSQL 驅動
+   （psycopg 3 為建議，新增依賴需授權）；以測試驗證各 CHECK 約束（見 `schema.md` 第八節）。
+2. **4C**：最新快照寫入。開工前以真實資料取得各站 `info_time` 落後分布以決定新鮮度門檻，
+   並實測每批原始檔大小。
+3. 考前開發至 11/9 截止，4C 未完成即移到考後。
+
+已決定、不再列為待辦：擷取排程執行環境與原始檔儲存位置（A1、A2：GCP e2-micro、VM 持久磁碟）。

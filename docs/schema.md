@@ -33,7 +33,8 @@ fetch_batches ──1:N──> station_snapshots <──N:1── stations
 
 1. **時間一律為 `timestamptz`，以 UTC 寫入**【定版】。`transform.py` 輸出的 Asia/Taipei 時間在寫入時轉換，不另存當地時間字串。
 2. **資料庫約束是最後防線，不取代驗證**【4A-1 確認】。資料是否有效（`is_valid`）由 Python 的清洗與逐站驗證流程判斷；資料庫只拒絕「邏輯上不可能」的組合，例如標記為有效卻缺少數值。
-3. **主檔可放寬，觀測資料要可判斷**【4A-1 確認】。`stations` 除了 `station_id` 都允許 NULL，避免單站資料缺漏造成外鍵失敗或整批失敗。放寬 NULL 不代表該站的資料有效。
+3. **主檔可放寬，觀測資料要可判斷**【4A-1 確認】。`stations` 除了 `station_id` 與系統產生的 `first_seen_at`、`last_seen_at` 外，其餘站點欄位都允許 NULL，避免單站資料缺漏造成外鍵失敗或整批失敗。放寬 NULL 不代表該站的資料有效。
+4. **CHECK 約束必須明確排除 NULL**【4A-1 確認】。PostgreSQL 的 CHECK 只在結果為 `FALSE` 時拒絕；結果為 NULL（UNKNOWN）時視為通過。因此約束中凡是比較可為 NULL 的欄位（`>`、`BETWEEN`、`IN` 等），都要另外寫 `IS NOT NULL`，否則 NULL 會讓整個條件變成 UNKNOWN 而被放行。
 
 ---
 
@@ -58,7 +59,8 @@ CREATE TABLE fetch_batches (
   -- 與 collect.collect_once() 的實際輸出一致（見下方對照）
   CONSTRAINT fetch_batches_success_chk
     CHECK (status <> 'success' OR (
-      station_count > 0 AND raw_path IS NOT NULL AND error IS NULL)),
+      station_count IS NOT NULL AND station_count > 0
+      AND raw_path IS NOT NULL AND error IS NULL)),
   CONSTRAINT fetch_batches_failed_chk
     CHECK (status <> 'failed' OR (
       error IS NOT NULL AND station_count IS NULL AND source_updated_at IS NULL))
@@ -143,8 +145,8 @@ CREATE TABLE stations (
 | `first_seen_at` | — | 該站第一次寫入快照時的 `slot_time`。供預期樣本規則「新站從首次出現的時間槽開始計算」使用 |
 | `last_seen_at` | — | 該站最近一次寫入快照時的 `slot_time` |
 
-- **【4A-1 確認】** 除 `station_id` 外皆允許 NULL。
-- `first_seen_at`、`last_seen_at` 由系統產生，一定有值，因此 NOT NULL。
+- **【4A-1 確認】** 除 `station_id`、`first_seen_at`、`last_seen_at` 外，其餘站點欄位允許 NULL。
+- `first_seen_at`、`last_seen_at` 由系統產生，不依賴來源資料品質，一定有值，因此 NOT NULL。
 - **沒有 `station_id` 的原始資料無法寫入任何資料表**，在 4C 計為「跳過」（見第六節）。
 
 ### 待定
@@ -181,7 +183,7 @@ CREATE TABLE station_snapshots (
   CONSTRAINT snapshots_reason_chk
     CHECK (
       (is_valid AND invalid_reason IS NULL)
-      OR (NOT is_valid AND invalid_reason IN (
+      OR (NOT is_valid AND invalid_reason IS NOT NULL AND invalid_reason IN (
             'inactive', 'stale', 'missing_field', 'invalid_type',
             'capacity_invalid', 'count_invalid', 'duplicate_conflict'))),
 
@@ -190,6 +192,9 @@ CREATE TABLE station_snapshots (
     CHECK (NOT is_valid OR (
       is_active IS TRUE
       AND info_time IS NOT NULL
+      AND total_spaces IS NOT NULL
+      AND available_bikes IS NOT NULL
+      AND available_spaces IS NOT NULL
       AND total_spaces >= 0
       AND available_bikes  BETWEEN 0 AND total_spaces
       AND available_spaces BETWEEN 0 AND total_spaces))
@@ -292,7 +297,7 @@ CREATE TABLE station_hourly_stats (
 - `sum_available_docks` 為有效樣本 `available_spaces` 的總和（命名差異見 v1.1 5.2）。
 - 保存 Sum 不保存 Average；平均、比例、覆蓋率於查詢時計算【定版】。
 - `hour_start` 對齊 UTC 整點【4A-1 確認】。每日彙總以 Asia/Taipei 日期切分；台灣為 UTC+8 整時差，UTC 整點即台灣整點。
-- `integer` 足夠：單站單小時最多 12 筆，即使容量 99，Sum 也不超過 1,188。
+- Sum 欄位暫定 `integer`。Schema 沒有限制 `total_spaces` 的上限（容量 99 是允許值，不是上限），所以 Sum 沒有固定的最大值。**【待定：4D】** 依實際資料評估是否改用 `bigint`。
 
 ### 待定
 
@@ -375,4 +380,8 @@ v1.1 第六節的實作規則與 4.2 的流程，與本規格的對應：
 - 以測試驗證各 CHECK 約束，特別是：
   - `extract(epoch FROM ...) % 300 = 0` 對齊檢查在不同 session 時區設定下行為一致。
   - 有效列缺少數值、無效列沒有原因、`invalid_reason` 為空字串時都會被拒絕。
+  - **NULL 邊界**（共通原則 4）：以下每一種都必須被拒絕：
+    - `is_valid = true` 且 `total_spaces`、`available_bikes`、`available_spaces` 任一為 NULL。
+    - `is_valid = false` 且 `invalid_reason` 為 NULL。
+    - `status = 'success'` 且 `station_count` 為 NULL。
   - `fetch_batches` 三種情境的合法資料都能寫入。
