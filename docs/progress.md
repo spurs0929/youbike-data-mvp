@@ -3,8 +3,9 @@
 記錄每個批次實際完成的內容、做出的設計決策與理由，以及已知限制。
 整體架構與後續規劃以「YouBike 2.0 專案設計定版 v1.1」為準，本文件只記錄已實作的部分。
 
-- 最後更新：2026-11-02
-- 測試數量：67 項（transform 28 項、collect 39 項）
+- 最後更新：2026-11-05
+- 測試數量：128 項（transform 28 項、collect 39 項、schema 61 項）。
+  未設定測試資料庫時為 67 passed、61 skipped。
 
 ---
 
@@ -184,14 +185,39 @@ transform.py  Pandas 清洗與型別轉換      （Batch 2）
 
 ---
 
+## Batch 4A：Schema 規格與 migration（`docs/schema.md`、`migrations/001_init.sql`）
+
+### 4A-1：Schema 規格
+
+四張表 `fetch_batches`、`stations`、`station_snapshots`、`station_hourly_stats` 的欄位、約束與
+4C 寫入流程，都記錄在 [schema.md](schema.md)。
+
+### 4A-2：migration 與約束測試
+
+- **工具選擇**：純 SQL migration ＋ psycopg 3，不使用 Alembic 或 SQLAlchemy。
+- **依賴位置**：目前只有測試會連資料庫，所以 `psycopg[binary]>=3.2,<4` 只放在 `requirements-dev.txt`。
+  4C 開始由應用程式寫入資料庫時，再移到 `requirements.txt`。
+- **重複執行策略**：
+  - 整個檔案包在單一 transaction，任何一步失敗都全部回滾。
+  - 刻意不用 `IF NOT EXISTS`，避免舊定義被靜默沿用，讓資料庫和規格悄悄不一致。
+  - 只對全新 schema 執行一次，重複執行會失敗。後續變更開新檔 `002_*.sql`，不修改已套用的檔案。
+- **測試隔離**：
+  - 以環境變數 `YOUBIKE_TEST_DATABASE_URL` 指定測試資料庫，未設定時全部 skip。
+  - 已設定時，無法連線、未安裝 psycopg、或資料庫名稱不含 `test`，一律報錯而非 skip，
+    避免「以為測過，其實全部略過」，也避免誤用正式資料庫。
+  - 每次執行建立隨機 schema，結束時只刪除該 schema；每個測試包在 transaction 中並回滾。
+- **驗證**：本機（Windows，PostgreSQL 16.15）128 項全部通過。將約束退回修正前版本時，恰好 5 項 NULL 測試失敗，
+  確認測試確實抓得到 CHECK 遇到 NULL 視為通過的漏洞。
+
+---
+
 ## 下一步
 
-依《設計定版 v1.1》第十二節。Batch 4A-1 Schema 規格已完成，見 [docs/schema.md](schema.md)。
+依《設計定版 v1.1》第十二節。Batch 4A 已完成。
 
-1. **4A-2**：依 `docs/schema.md` 撰寫四張表的 migration；決定 migration 工具與 PostgreSQL 驅動
-   （psycopg 3 為建議，新增依賴需授權）；以測試驗證各 CHECK 約束（見 `schema.md` 第八節）。
-2. **4C**：最新快照寫入。開工前以真實資料取得各站 `info_time` 落後分布以決定新鮮度門檻，
-   並實測每批原始檔大小。
+1. **4C 準備**：本機執行 `collect.py --loop` 約 30 分鐘，以 `explore.py` 取得各站 `info_time`
+   落後分布與每批原始檔大小，作為新鮮度門檻的依據。
+2. **4C**：最新快照寫入。開工前需先決定 `schema.md` 第六節與設計定版附錄 A 的待議事項。
 3. 考前開發至 11/9 截止，4C 未完成即移到考後。
 
 已決定、不再列為待辦：擷取排程執行環境與原始檔儲存位置（A1、A2：GCP e2-micro、VM 持久磁碟）。
