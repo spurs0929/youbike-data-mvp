@@ -1,14 +1,15 @@
 # PostgreSQL Schema 規格（Batch 4A-1）
 
-- 依據：《YouBike 2.0 專案設計定版 v1.1》第四～六節
-- 狀態：**規格與 SQL 草案**。尚未建立資料庫，也尚未撰寫 migration；正式 DDL 於 4A-2 依本文件產生。
-- 最後更新：2026-11-02
+- 依據：《YouBike 2.0 專案設計定版 v1.2》第四～六節（4C 寫入規則見定版 4.4）
+- 狀態：第二～五節的 SQL 已轉為正式 migration `migrations/001_init.sql`（4A-2），並由 `tests/test_schema.py` 驗證。第六節的 4C 寫入規則已確定，尚未實作。
+- 最後更新：2026-11-07
 
 本文件中的標記：
 
-- **【定版】**：v1.1 已確定的設計。
-- **【4A-1 確認】**：本次規格審閱時確認的約束（2026-11-02）。
-- **【待定】**：v1.1 附錄 A 的待議事項，或屬於後續 Batch 的實作細節。本文件只記錄，不做決定。
+- **【定版】**：設計定版已確定的設計。
+- **【4A-1 確認】**：4A-1 規格審閱時確認的約束（2026-11-02）。
+- **【4C 確認】**：4C 開工前確認的寫入規則（2026-11-07，定版 v1.2 4.4）。
+- **【待定】**：定版附錄 A 的待議事項，或屬於後續 Batch 的實作細節。本文件只記錄，不做決定。
 
 ---
 
@@ -73,7 +74,7 @@ CREATE TABLE fetch_batches (
 |---|---|
 | `id` | 資料庫內部識別，供 `station_snapshots.fetch_batch_id` 參照【定版：A4】 |
 | `batch_id` | 擷取批次識別，例如 `20261027T081500Z-3f9a1c`。唯一鍵，匯入冪等的依據 |
-| `fetched_at` | 實際擷取時間（UTC） |
+| `fetched_at` | 擷取時間（UTC），為 HTTP 請求**開始**時間。4C 時間槽歸屬與新鮮度計算的依據【4C 確認】 |
 | `source_updated_at` | 該批各站 `srcUpdateTime` 的最大值（UTC）；無法解析時為 NULL。**不用於新鮮度判斷**【定版：新鮮度看各站 `info_time`】 |
 | `status` | 僅代表擷取階段。`success` = 下載成功且通過結構驗證；**不代表**快照已寫入 |
 | `station_count` | 該批站點數；失敗時為 NULL |
@@ -141,7 +142,7 @@ CREATE TABLE stations (
 | `station_name` | `station_name`（已移除 `YouBike2.0_` 前綴） | 可為 NULL |
 | `district` | `district`（原 `sarea`） | 可為 NULL |
 | `address` | `address`（原 `ar`） | 可為 NULL |
-| `latitude` / `longitude` | 同名 | 可為 NULL。**不在資料庫檢查座標範圍**，範圍異常由驗證流程處理 |
+| `latitude` / `longitude` | 同名 | 可為 NULL。**不在資料庫檢查座標範圍**；非有限值或超出範圍（緯度 −90～90、經度 −180～180）時由驗證流程轉為 NULL【4C 確認】 |
 | `first_seen_at` | — | 該站第一次寫入快照時的 `slot_time`。供預期樣本規則「新站從首次出現的時間槽開始計算」使用 |
 | `last_seen_at` | — | 該站最近一次寫入快照時的 `slot_time` |
 
@@ -149,10 +150,27 @@ CREATE TABLE stations (
 - `first_seen_at`、`last_seen_at` 由系統產生，不依賴來源資料品質，一定有值，因此 NOT NULL。
 - **沒有 `station_id` 的原始資料無法寫入任何資料表**，在 4C 計為「跳過」（見第六節）。
 
-### 待定
+### 更新策略【4C 確認】
 
-- **【待定：4C，附錄 A】** 站點新增、改名、停用時的更新策略：名稱、地址、座標是否以最新觀測值覆寫，以及新觀測值為 NULL 時是否覆寫既有值。
-- **【待定：4C】** 歷史快照重建時寫入較早的 `slot_time`，`first_seen_at` 是否往前修正（建議取 `LEAST`）。
+```sql
+INSERT INTO stations (station_id, station_name, district, address,
+                      latitude, longitude, first_seen_at, last_seen_at)
+VALUES (...)
+ON CONFLICT (station_id) DO UPDATE SET
+  station_name = CASE WHEN EXCLUDED.last_seen_at >= stations.last_seen_at
+                      THEN COALESCE(EXCLUDED.station_name, stations.station_name)
+                      ELSE stations.station_name END,
+  -- district、address、latitude、longitude 同樣寫法
+  first_seen_at = LEAST(stations.first_seen_at, EXCLUDED.first_seen_at),
+  last_seen_at  = GREATEST(stations.last_seen_at, EXCLUDED.last_seen_at);
+```
+
+- 名稱、行政區、地址、座標：只用**不早於該站最近快照槽**的非 NULL 值覆寫；新值為 NULL 時保留舊值。
+- `first_seen_at` 取 `LEAST`、`last_seen_at` 取 `GREATEST`，歷史快照重建寫入較早的槽時會自動往前修正。
+- 只有 `clean()` 成功的站提供站點資訊；結構無效的站只確保列存在並更新時間欄位。
+- 重跑時因快照已存在而被略過的站，不更新 `stations`（第六節）。
+- 站點從來源消失時不處理，也不保存改名歷史。
+- **已知限制（接受）**：以站點最近快照槽為界。先寫入 08:10 的無效快照、再補 08:00 時，08:00 只往前修正 `first_seen_at`，不補齊名稱；下一個有效槽會補上。
 
 ---
 
@@ -211,7 +229,7 @@ CREATE INDEX station_snapshots_slot_time_brin
 | `station_id` | `station_id` | 參照 `stations` |
 | `slot_time` | — | 5 分鐘時間槽起點（UTC）【4A-1 確認：對齊 UTC 整 5 分鐘】 |
 | `fetch_batch_id` | — | 產生此快照的批次，參照 `fetch_batches.id`【定版：A4】 |
-| `info_time` | `info_time` | 該站自身的資料時間，新鮮度判斷依據【定版】。無法解析時為 NULL |
+| `info_time` | `info_time` | 來源回傳的該站資料時間，新鮮度判斷依據【定版】。無法解析時為 NULL |
 | `is_active` | `is_active`（原 `act`） | `true` 營運中、`false` 暫停營運、**NULL 無法判斷** |
 | `total_spaces` | `total_spaces`（原 `Quantity`） | 無法解析時為 NULL |
 | `available_bikes` | `available_bikes`（原 `available_rent_bikes`） | 同上 |
@@ -231,16 +249,34 @@ CREATE INDEX station_snapshots_slot_time_brin
 |---|---|---|
 | `inactive` | 站點暫停營運（`is_active = false`） | 暫停營運站點 |
 | `stale` | `info_time` 未達新鮮度門檻 | 來源更新時間過期 |
-| `missing_field` | 必要欄位缺失 | 欄位缺失 |
-| `invalid_type` | 欄位值無法轉換為預期型別，或 `act` 不是 `"1"`／`"0"` | 資料型別不正確 |
+| `missing_field` | 必要欄位的原始值為 NULL 或空白 | 欄位缺失 |
+| `invalid_type` | 必要欄位非空但無法轉換為預期型別、`act` 不是 `"1"`／`"0"`，或數值超出 PostgreSQL `integer` 範圍 | 資料型別不正確 |
 | `capacity_invalid` | `total_spaces` 為負 | 車位容量異常 |
 | `count_invalid` | 車輛數或車位數為負，或超過 `total_spaces` | 車輛數量異常 |
 | `duplicate_conflict` | 同一回應中同一 `station_id` 內容不一致 | Batch 2 的衝突判斷 |
 
 - 每列只記一個原因。新增代碼需修改 CHECK 約束（migration）。
-- **【待定：4C】** 同時符合多個原因時的判斷順序。
-- **【待定：4C】** `duplicate_conflict` 時同一 `station_id` 有多筆來源資料，該寫入哪一筆。
 - `total_spaces = 0` 與容量 99 不屬於無效【定版：實作規則 3】，CHECK 也允許。
+- **必要欄位**：`sno`、`act`、`infoTime`、`Quantity`、`available_rent_bikes`、`available_return_bikes`。`sno` 為 NULL 或空白時不寫入任何表，計為「跳過」。
+
+#### 判定順序【4C 確認】
+
+同時符合多個原因時，取第一個成立者：
+
+`duplicate_conflict` → `missing_field` → `invalid_type` → `inactive` → `stale` → `capacity_invalid` → `count_invalid`
+
+- `missing_field`、`invalid_type` **以原始值判定**，不依 `clean()` 是否成功，也不解析例外訊息，確保整批與逐站兩條路徑得到相同結果（第六節）。
+- `duplicate_conflict`：同一 `station_id` 多筆時，只比較快照與 `stations` 會用到的欄位；全部相同則保留一筆、不算衝突。
+
+#### 無效列的欄位值【4C 確認】
+
+| 原因 | 寫入的值 |
+|---|---|
+| `duplicate_conflict` | 只寫一列。數值與 `info_time` 為 NULL；多筆的 `act` 一致且可判定時才寫 `is_active` |
+| `missing_field`、`invalid_type` | 數值與 `info_time` 為 NULL；`act` 可判定時**獨立**寫入 `is_active` |
+| `inactive` 以後 | `clean()` 已成功，寫入完整清洗後的值 |
+
+保留 `is_active` 的原因：4D 計算 `expected_samples` 依 `is_active` 判斷，不依 `invalid_reason`（第七節規則 2）。
 
 ### 索引
 
@@ -309,14 +345,54 @@ CREATE TABLE station_hourly_stats (
 
 ## 六、4C 最新快照寫入流程（規格）
 
-依 v1.1 4.2。具體交易實作留到 4C，本節只規定行為。
+依定版 v1.2 4.2、4.4。具體程式留到 4C-2、4C-3，本節只規定行為。
+
+### 時間槽與批次【4C 確認】
+
+- 時間槽為 UTC 五分鐘半開區間 `[T, T+5 分)`，以批次 `fetched_at` 歸槽。
+- 排程每 5 分鐘處理**最近一個已結束**的槽；`--slot` 參數供手動補跑指定槽。
+- **零快照的槽**：從 `fetch_batches.jsonl` 選批次，取槽內 `status = success` 中 `fetched_at` 最新者；同時戳依 `batch_id` 排序取最後一個。不能只看檔案是否存在【定版】。
+- **已有快照的槽**：不從 JSONL 重新選批次。沿用該槽唯一的 `fetch_batch_id`，查 `fetch_batches.raw_path` 讀原始檔，只補缺少的站。
+- JSONL 於擷取完成後才寫入，槽結束時仍可能有槽內開始的擷取尚未落地。上述規則確保這類晚到批次不會讓同一槽混入兩份來源。
+- 排程與擷取正常時，快照約每 5 分鐘更新，資料時間另受來源延遲影響；槽內無成功批次時，上一筆快照可能保留更久。
+
+### 新鮮度【4C 確認】
+
+- `lag = fetched_at − info_time`，`fetched_at` 為選中批次的擷取時間，不使用 `slot_time` 或執行當下時間（重跑與歷史重建結果可重現）。
+- `lag > 10 分鐘` 判為 `stale`；剛好 10 分鐘仍有效。10 分鐘為暫定值，寫成常數。
+- 負落後（`info_time` 晚於 `fetched_at`）不判無效，只在處理結果中另計警告。
+
+### 逐站驗證【4C 確認】
+
+範圍：只處理 `status = success` 的批次。`fetch.validate_shape()` 已保證每站都有所有必要鍵（任一站缺鍵會讓整批 `failed`），所以逐站隔離的對象是成功批次內的 NULL、空白、型別錯誤與值異常。
+
+不修改 Batch 2 的 `clean()`：
+
+1. **前處理**：`sno` 統一為去空白字串，NULL 或空白則跳過。同一 `station_id` 多筆依第四節判斷是否為 `duplicate_conflict`；衝突的站不進入 `clean()`。
+2. **快速路徑**：其餘站點整批呼叫一次 `clean()`。
+3. **備援路徑**：整批丟出 `TransformError` 時，逐站以單列 DataFrame 呼叫 `clean()`。單站失敗時，先將可選欄位的值轉為 NULL 後重試一次，保留其餘正常欄位。
+4. **值檢查**：依第四節的判定順序給出 `is_valid` 與 `invalid_reason`。
+
+**兩條路徑必須一致**：
+
+- 結構類原因（`missing_field`、`invalid_type`）以原始值判定（第四節）。
+- 可選欄位的值檢查在 `clean()` 之後執行，兩條路徑都生效，只清除該欄位、不讓該站無效：
+  - 座標非有限值或超出範圍 → NULL。例如座標 `999` 能通過 `clean()` 的浮點轉換，仍須轉為 NULL。
+  - 文字欄位去空白後為空 → NULL。
+- 可選欄位：名稱、行政區、地址、座標、`srcUpdateTime`、`updateTime`。
+
+實測成本（1,824 站）：整批 `clean()` 約 11 ms，逐站約 7 秒，因此只在失敗時走備援。
 
 ### 流程
 
-1. **挑選批次**：從 `fetch_batches.jsonl` 找出該時間槽的 `status = success` 批次，讀取其 gzip。不能只看檔案是否存在【定版】。
-2. **逐站驗證**：在 Python 中逐站驗證與清洗，產生 `is_valid` 與 `invalid_reason`。單站有問題只標記該站，不讓整批作廢【定版】。
-3. **開始 transaction**。
-4. **確保批次列存在**【定版】：
+1. **取得同槽鎖**【4C 確認】：排程與手動補跑對同一槽互斥（例如以 `slot_time` 為鍵的 `pg_advisory_xact_lock`，實作時確認），取得後才查詢既有快照。
+2. **決定來源批次**：依「時間槽與批次」。
+   - 槽內無成功批次 → 不寫入，結果 `no_batch`。
+   - 該槽已有多個不同的 `fetch_batch_id` → 不寫入，結果 `failed`，回報衝突。
+   - 選中批次的 gzip 缺失或損壞 → 結果 `failed`；已有快照的槽保留既有快照。
+3. **逐站驗證**：依「逐站驗證」，產生 `is_valid` 與 `invalid_reason`。
+4. **開始 transaction**。
+5. **確保批次列存在**【定版】：
    ```sql
    INSERT INTO fetch_batches (batch_id, fetched_at, ...)
    VALUES (...)
@@ -325,58 +401,72 @@ CREATE TABLE station_hourly_stats (
    ```
    `DO NOTHING` 遇到既有列時不回傳任何列，此時再以 `SELECT id FROM fetch_batches WHERE batch_id = ...` 取得 `id`。寫入的值取自 JSONL 中該批次的紀錄。
    **這一步失敗時整個 transaction 回滾**，不寫入任何快照。
-5. **逐站寫入，每站隔離**【4A-1 確認】：
+6. **逐站寫入，每站隔離**【4A-1 確認】：
    - 每站開始前建立 `SAVEPOINT`（或等效機制）。
-   - 依序 upsert `stations`、寫入 `station_snapshots`。
+   - 寫入 `station_snapshots`，採 `ON CONFLICT (station_id, slot_time) DO NOTHING`【4C 確認】。實際寫入時才 upsert `stations`（第三節）；因已存在而略過時計為「已存在」，不更新 `stations`。
    - 成功則 `RELEASE SAVEPOINT`；失敗則 `ROLLBACK TO SAVEPOINT`，只撤銷該站，其餘站點繼續。
    - 原因：PostgreSQL 的 transaction 一旦發生錯誤即進入失敗狀態，後續指令都會被拒絕。沒有 savepoint 時，一站失敗就會連帶整批失敗。
-   - 驗證在步驟 2 完成，savepoint 是資料庫層的最後防線，正常情況下很少觸發。
-6. **commit**，並輸出處理結果。
+   - 驗證在步驟 3 完成，savepoint 是資料庫層的最後防線，正常情況下很少觸發。
+7. **commit**，並輸出處理結果。
 
-### 處理結果【4A-1 確認】
+驗證規則改變時，舊快照不會因重跑而更新；需先刪除該範圍再重跑。
 
-每次執行必須輸出以下計數：
+### 處理結果【4C 確認】
+
+每次執行輸出**一行 JSON** 到日誌（由 cron 導向檔案）。依定版 5.4 不另建狀態表，也不回寫 `fetch_batches`。
+
+| `result` | 條件 |
+|---|---|
+| `success` | 處理完成，且沒有跳過或單站寫入失敗。純重跑且全部已存在也算 |
+| `partial` | 至少一站已寫入或原本已存在，且有跳過或失敗 |
+| `failed` | 整筆 transaction 回滾；選到批次但沒有任何快照成功保留；同槽多批次衝突；gzip 缺失或損壞 |
+| `no_batch` | 槽內沒有成功的擷取批次 |
+
+計數：
 
 | 計數 | 意義 |
 |---|---|
-| 寫入（有效） | 寫入快照且 `is_valid = true` |
-| 寫入（無效） | 寫入快照且 `is_valid = false`，依原因代碼分列 |
-| 跳過 | 無法寫入的資料，例如缺少 `station_id`；重跑時已存在的快照是否計入，依 4C 的重跑策略而定 |
+| 寫入（有效） | 本次寫入快照且 `is_valid = true` |
+| 寫入（無效） | 本次寫入快照且 `is_valid = false`，依原因代碼分列 |
+| 已存在 | 快照已存在而略過（重跑），不算跳過 |
+| 跳過 | 無法寫入的資料，例如 `sno` 為 NULL 或空白 |
 | 失敗 | savepoint 回滾的站點 |
 
-- **只要有任何站點失敗或跳過，結果不得回報為完全成功。**
-- 這是 4C 的處理結果，與 `fetch_batches.status`（擷取階段）是兩回事，不回寫到 `fetch_batches`。
-- 依 v1.1 5.4 不另建狀態表。**【待定：4C】** 計數只輸出到 stdout／排程日誌，或另外保存。
+- transaction 回滾時，不得把暫存計數報成已寫入。
+- **整批過期告警**：至少有一個已知營運中站（`is_active = true`），且這些站全數為 `stale` 時，只告警一次。仍有營運狀態未知的站時，訊息寫「已知營運中站點全數過期」並列出未知站數。逐站仍照常寫入 `stale` 列。
+- 整批過期但所有無效列都已成功保存時，`result` 可為 `success`，並附帶過期告警。
+- 負落後數另列為警告。
+- 快照存在只證明該槽至少寫入一站，不代表完整。
 
 ### 待定
 
-- **【待定：4C，附錄 A】** 新鮮度門檻。
-- **【待定：4C】**「該時間槽的批次」的時間窗定義（例如槽內最後一個成功批次），以及槽內沒有成功批次時的處理。
-- **【待定：4C】** 同一時間槽重跑時，快照採 `ON CONFLICT DO NOTHING`（保留既有）或 `DO UPDATE`（覆寫）。
-- **【待定：4C，附錄 A】** 逐站驗證層的實作方式（不重構 Batch 2 `clean()` 的前提下）。
+- **【待定：API 階段】** 查詢端如何提示資料過期。`max(info_time)` 可能被單一較新的站掩蓋其他過期站。
+- **【待定：部署】** 新鮮度門檻依平日尖峰實測複核；日誌輪替。
 
 ---
 
 ## 七、實作規則對照
 
-v1.1 第六節的實作規則與 4.2 的流程，與本規格的對應：
+定版第六節的實作規則與 4.2、4.4 的流程，與本規格的對應：
 
 | 規則 | 對應的欄位、約束或步驟 | 資料庫負責 | 程式負責 |
 |---|---|---|---|
-| 規則 1：有效樣本 | `is_valid`、`snapshots_valid_values_chk`、`hourly_subset_chk` | 有效列必須營運中、有 `info_time`、數值合理；彙總計數不超過有效樣本 | 新鮮度判斷（門檻待定）、所有驗證 |
+| 規則 1：有效樣本 | `is_valid`、`snapshots_valid_values_chk`、`hourly_subset_chk` | 有效列必須營運中、有 `info_time`、數值合理；彙總計數不超過有效樣本 | 新鮮度判斷（`lag > 10 分鐘` 為 stale，第六節）、所有驗證 |
 | 規則 2：預期樣本 | `stations.first_seen_at`、`is_active` 三值、`hourly_samples_chk` | 每小時最多 12 筆；有效不超過預期 | 4D 計算：新站從 `first_seen_at` 起算；`is_active = false` 不計入；`is_active` 為 NULL 或缺快照時**不可**當作暫停營運 |
 | 規則 3：容量異常 | `snapshots_valid_values_chk`、`capacity_invalid`、`count_invalid` | 有效列的非負與上限檢查；允許 `total_spaces = 0` | 判定並寫入原因代碼 |
 | 規則 4：彙總與清理 | `station_hourly_stats` 主鍵、BRIN 索引 | 主鍵支援 upsert 冪等 | 「彙總完整」判斷（待定）、當前小時不做最終彙總、4E 清理條件 |
-| 4.2 批次挑選 | 第六節步驟 1 | — | 只選 `status = success` |
-| 4.2 批次列確保存在 | 第六節步驟 4、`fetch_batches.batch_id` UNIQUE | `ON CONFLICT` 冪等 | 同一 transaction 內執行 |
-| 4.2 逐站隔離 | 第六節步驟 5、`stations` 放寬 NULL | savepoint 回滾單站 | 結果計數，不得把部分失敗回報為完全成功 |
+| 4.2、4.4.1 批次挑選 | 第六節「時間槽與批次」、步驟 1～2 | — | 只選 `status = success`；已有快照的槽沿用原批次；同槽互斥 |
+| 4.2 批次列確保存在 | 第六節步驟 5、`fetch_batches.batch_id` UNIQUE | `ON CONFLICT` 冪等 | 同一 transaction 內執行 |
+| 4.2、4.4.3 逐站隔離 | 第六節「逐站驗證」、步驟 6、`stations` 放寬 NULL | savepoint 回滾單站 | 整批與逐站路徑結果一致；`result` 分類，不得把部分失敗回報為完全成功 |
 | 4.3 追溯性 | `fetch_batch_id` → `fetch_batches.id` | 外鍵 | — |
 
 ---
 
 ## 八、交給 4A-2 的事項
 
-- 將第二～五節的 SQL 草案轉為正式 migration（工具與 PostgreSQL 驅動於 4A-2 決定，psycopg 3 為建議）。
+已於 4A-2 完成（`migrations/001_init.sql`、`tests/test_schema.py`）。保留本節作為測試範圍的紀錄。
+
+- 將第二～五節的 SQL 草案轉為正式 migration（4A-2 決定：純 SQL ＋ psycopg 3）。
 - 以測試驗證各 CHECK 約束，特別是：
   - `extract(epoch FROM ...) % 300 = 0` 對齊檢查在不同 session 時區設定下行為一致。
   - 有效列缺少數值、無效列沒有原因、`invalid_reason` 為空字串時都會被拒絕。

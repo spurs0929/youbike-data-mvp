@@ -1,9 +1,9 @@
 # 開發紀錄與設計決策
 
 記錄每個批次實際完成的內容、做出的設計決策與理由，以及已知限制。
-整體架構與後續規劃以「YouBike 2.0 專案設計定版 v1.1」為準，本文件只記錄已實作的部分。
+整體架構與後續規劃以「YouBike 2.0 專案設計定版 v1.2」為準，本文件只記錄已實作的部分。
 
-- 最後更新：2026-11-05
+- 最後更新：2026-11-07
 - 測試數量：128 項（transform 28 項、collect 39 項、schema 61 項）。
   未設定測試資料庫時為 67 passed、61 skipped。
 
@@ -195,8 +195,8 @@ transform.py  Pandas 清洗與型別轉換      （Batch 2）
 ### 4A-2：migration 與約束測試
 
 - **工具選擇**：純 SQL migration ＋ psycopg 3，不使用 Alembic 或 SQLAlchemy。
-- **依賴位置**：目前只有測試會連資料庫，所以 `psycopg[binary]>=3.2,<4` 只放在 `requirements-dev.txt`。
-  4C 開始由應用程式寫入資料庫時，再移到 `requirements.txt`。
+- **依賴位置**：4A-2 時只有測試會連資料庫，`psycopg[binary]>=3.2,<4` 放在 `requirements-dev.txt`。
+  4C-1 已移到 `requirements.txt`（見下方 Batch 4C）。
 - **重複執行策略**：
   - 整個檔案包在單一 transaction，任何一步失敗都全部回滾。
   - 刻意不用 `IF NOT EXISTS`，避免舊定義被靜默沿用，讓資料庫和規格悄悄不一致。
@@ -211,13 +211,33 @@ transform.py  Pandas 清洗與型別轉換      （Batch 2）
 
 ---
 
+## Batch 4C：最新快照寫入（進行中）
+
+### 4C 準備：實測（2026-11-07，repo 未修改）
+
+本機 `collect.py --loop` 週六清晨 30 分鐘、30 批，每批 1,824 站：
+
+- 營運中站點 `info_time` 落後 P99＝最大＝2.0 分；超過 5 分鐘的觀測為 0。
+- 各站 `info_time` 高度同步，適合偵測來源更新停滯，無法判斷單站設備離線。
+- gzip 每批約 104 KB，每月約 4.3 GB。
+- 限制：只有離峰樣本，且未保存 `fetch_batches.jsonl`，無法確認期間是否有失敗批次。
+
+### 4C-1：寫入規則與依賴
+
+- 寫入規則依設計定版 v1.2 4.4 寫入 [schema.md](schema.md) 第三、四、六節，4C 相關【待定】全部改為【4C 確認】。
+  重點：新鮮度 `fetched_at − info_time > 10 分鐘`（暫定）、已有快照的槽補跑沿用原批次、
+  整批 `clean()` 快速路徑＋逐站備援、無效原因判定順序、`result` 四種分類。
+- `psycopg[binary]>=3.2,<4` 從 `requirements-dev.txt` 移到 `requirements.txt`（dev 透過 `-r requirements.txt` 繼承）。
+- 本次只改文件與依賴，程式與測試未變。
+
+---
+
 ## 下一步
 
-依《設計定版 v1.1》第十二節。Batch 4A 已完成。
+依《設計定版 v1.2》第十二節。考前開發至 11/9 截止，以下移到 11/15 之後：
 
-1. **4C 準備**：本機執行 `collect.py --loop` 約 30 分鐘，以 `explore.py` 取得各站 `info_time`
-   落後分布與每批原始檔大小，作為新鮮度門檻的依據。
-2. **4C**：最新快照寫入。開工前需先決定 `schema.md` 第六節與設計定版附錄 A 的待議事項。
-3. 考前開發至 11/9 截止，4C 未完成即移到考後。
+1. **4C-2**：逐站驗證層（`schema.md` 第四、六節）＋單元測試，不接觸資料庫。
+2. **4C-3**：資料庫寫入＋整合測試。關鍵情境：首次部分寫入後，JSONL 才出現同槽較新的成功批次，補跑仍須使用原批次。
+3. 部署與 HTTPS → API → LINE Bot → LLM。
 
 已決定、不再列為待辦：擷取排程執行環境與原始檔儲存位置（A1、A2：GCP e2-micro、VM 持久磁碟）。
