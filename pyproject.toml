@@ -2,3 +2,8 @@
 # src/ is a folder of scripts, not an installed package; let tests import from it.
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+# 本機開發環境為 Python 3.10；固定目標版本，避免 ruff 依執行環境的 Python 版本
+# 套用 3.11 以上的規則（例如 UP017 要求改用 datetime.UTC，3.10 沒有這個名稱）。
+target-version = "py310"
