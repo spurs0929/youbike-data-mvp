@@ -1,0 +1,18 @@
+# YouBike D0 排程：安裝到專用使用者 youbike 的 crontab（不是 root）
+#   sudo crontab -u youbike /home/youbike/youbike-data-mvp/deploy/crontab.txt
+#
+# - VM 系統時區維持 UTC，cron 以 UTC 解讀（定版 v1.3 11.2）。
+# - 單一寫入者：擷取一律經 flock -n；上一次還沒結束時，這一分鐘直接跳過。
+#   VM 上不得另外執行 collect.py --loop，也不要在 cron 運作中手動執行 collect.py。
+# - 健康檢查只讀檔，不受鎖限制。
+# - cron 不會展開變數裡的變數，路徑一律寫完整。
+
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+YOUBIKE_DATA_DIR=/home/youbike/data
+
+# 每分鐘擷取一次
+* * * * * cd /home/youbike/youbike-data-mvp && flock -n /home/youbike/collect.lock .venv/bin/python src/collect.py >> /home/youbike/logs/collect.log 2>&1
+
+# 每 5 分鐘健康檢查：最近成功擷取（> 10 分鐘警告）＋磁碟使用率（>= 80% 警告）
+*/5 * * * * cd /home/youbike/youbike-data-mvp && .venv/bin/python deploy/check_health.py >> /home/youbike/logs/health.log 2>&1

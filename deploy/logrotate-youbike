@@ -1,0 +1,24 @@
+# YouBike D0 日誌輪替：安裝到 /etc/logrotate.d/youbike（擁有者 root、權限 644）
+#   sudo install -m 644 -o root -g root deploy/logrotate-youbike /etc/logrotate.d/youbike
+#
+# 只處理 /home/youbike/logs/ 底下的 .log（collect.log、health.log）。
+# 原始 gzip（/home/youbike/data/raw/）與 fetch_batches.jsonl 是資料，不是日誌，
+# 不在這裡，也不會被清理（12/11 前不刪原始檔，定版 v1.3 4.1）。
+
+/home/youbike/logs/*.log {
+    # 日誌目錄屬於 youbike，以該使用者身分輪替
+    su youbike youbike
+    daily
+    # 保留 14 份（約 14 天），超過 14 天的封存檔也一併刪除
+    rotate 14
+    maxage 14
+    # 容量上限：單一日誌超過 20 MB 時，下次 logrotate 執行就輪替，不等到隔天
+    maxsize 20M
+    compress
+    delaycompress
+    dateext
+    missingok
+    notifempty
+    # cron 以 >> 附加寫入，沒有常駐程序可通知重開檔案，所以用複製後截斷
+    copytruncate
+}
