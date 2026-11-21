@@ -4,6 +4,7 @@
 """
 
 import copy
+import dataclasses
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -266,6 +267,106 @@ def test_fallback_matches_fast_path(bad):
     if "latitude" in bad:
         assert bad_station.info.latitude is None
         assert bad_station.info.longitude == pytest.approx(121.5436)
+
+
+def mixed_anomaly_batch():
+    """正常站與各種異常混在同一批；本身可以整批 clean()（走快速路徑）。"""
+    return [
+        record("OK1"),
+        record("OK2", Quantity="28", available_rent_bikes=17.0),
+        record(sno=None),  # 跳過
+        record(sno="   "),  # 跳過
+        record("DUP", available_rent_bikes=1),  # 重複且衝突
+        record("DUP", available_rent_bikes=2),
+        record("SAME"),  # 重複且相同
+        record("SAME"),
+        record("T1", infoTime="abc"),  # 必要時間格式錯誤
+        record("T2", infoTime=None),  # 必要時間缺失
+        record("C1", latitude=999),  # 座標超出範圍
+        record("C2", longitude=-181, latitude="Infinity"),
+        record("C3", latitude="", longitude=None),
+        record("STALE", infoTime="2026-11-21 14:00:00"),  # 過期
+        record("NEG", infoTime="2026-11-21 14:25:00"),  # 負落後
+        record("CAP", Quantity=-1),  # 容量異常
+        record("CNT", available_rent_bikes=99),  # 車輛數異常
+        record("OFF", act="0"),
+        record("UNK", act="x"),
+        record("TXT", sna="YouBike2.0_", sarea=" ", ar=None),
+        record(" PAD "),
+        record(500101009),
+    ]
+
+
+def all_stale_batch():
+    """已知營運中站點全數過期，且有營運狀態未知的站（觸發整批告警）。"""
+    old = "2026-11-21 14:00:00"
+    return [
+        record("A", infoTime=old),
+        record("B", infoTime=old, latitude=999),
+        record("C", act="0"),
+        record("D", act="x"),
+        record("E", infoTime=old, Quantity=-1),
+    ]
+
+
+@pytest.mark.parametrize("make_batch", [mixed_anomaly_batch, all_stale_batch])
+def test_forced_fallback_matches_fast_path_on_identical_input(monkeypatch, make_batch):
+    fast = run(make_batch())
+    assert fast.path == PATH_FAST
+
+    real_clean = snapshot.clean
+
+    def single_row_only(df):
+        # 整批呼叫一律失敗，強制改走逐站備援；單列呼叫照常清洗
+        if len(df) > 1:
+            raise TransformError("forced fallback")
+        return real_clean(df)
+
+    monkeypatch.setattr(snapshot, "clean", single_row_only)
+    fallback = run(make_batch())
+
+    assert fallback.path == PATH_FALLBACK
+    # 逐站結果（is_valid、invalid_reason、清洗後欄位）與批次層統計都必須相同
+    assert dataclasses.replace(fallback, path=fast.path) == fast
+
+
+def test_mixed_anomaly_batch_expected_results():
+    batch = run(mixed_anomaly_batch())
+    results = by_id(batch)
+
+    assert {sid: r.invalid_reason for sid, r in results.items()} == {
+        "OK1": None,
+        "OK2": None,
+        "DUP": "duplicate_conflict",
+        "SAME": None,
+        "T1": "invalid_type",
+        "T2": "missing_field",
+        "C1": None,
+        "C2": None,
+        "C3": None,
+        "STALE": "stale",
+        "NEG": None,
+        "CAP": "capacity_invalid",
+        "CNT": "count_invalid",
+        "OFF": "inactive",
+        "UNK": "invalid_type",
+        "TXT": None,
+        "PAD": None,
+        "500101009": None,
+    }
+    assert (results["C2"].info.latitude, results["C2"].info.longitude) == (None, None)
+    assert results["C1"].info.latitude is None
+    assert results["TXT"].info.station_name is None
+    assert batch.skipped == 2
+    assert batch.negative_lag == 1
+    assert batch.unknown_active == 1
+    assert batch.all_known_active_stale is False
+
+
+def test_all_stale_batch_raises_alert():
+    batch = run(all_stale_batch())
+    assert batch.all_known_active_stale is True
+    assert batch.unknown_active == 1
 
 
 def test_path_none_when_nothing_to_clean():

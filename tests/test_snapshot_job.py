@@ -278,12 +278,12 @@ def test_read_batch_log_does_not_modify_file(tmp_path):
     assert path.read_bytes() == before
 
 
-def records_of(tmp_path, lines):
-    return read_batch_log(write_log(tmp_path, lines)).records
+def log_of(tmp_path, lines) -> BatchLog:
+    return read_batch_log(write_log(tmp_path, lines))
 
 
 def test_select_latest_success_in_slot(tmp_path):
-    records = records_of(
+    log = log_of(
         tmp_path,
         [
             batch(at(5)),
@@ -293,13 +293,13 @@ def test_select_latest_success_in_slot(tmp_path):
         ],
     )
 
-    chosen = select_batch(records, SLOT)
+    chosen = select_batch(log, SLOT)
 
     assert chosen.fetched_at == at(8, 30)
 
 
 def test_select_ignores_batches_outside_slot(tmp_path):
-    records = records_of(
+    log = log_of(
         tmp_path,
         [
             batch(at(4, 59, 999999)),  # 上一槽
@@ -307,11 +307,11 @@ def test_select_ignores_batches_outside_slot(tmp_path):
             batch(at(10)),  # 下一槽
         ],
     )
-    assert select_batch(records, SLOT).fetched_at == at(6)
+    assert select_batch(log, SLOT).fetched_at == at(6)
 
 
 def test_select_tie_breaks_by_batch_id(tmp_path):
-    records = records_of(
+    log = log_of(
         tmp_path,
         [
             batch(at(6), batch_id="20261121T080600Z-cccccc"),
@@ -319,23 +319,23 @@ def test_select_tie_breaks_by_batch_id(tmp_path):
             batch(at(6), batch_id="20261121T080600Z-aaaaaa"),
         ],
     )
-    assert select_batch(records, SLOT).batch_id == "20261121T080600Z-ffffff"
+    assert select_batch(log, SLOT).batch_id == "20261121T080600Z-ffffff"
 
 
 def test_select_returns_none_without_success_in_slot(tmp_path):
-    records = records_of(
+    log = log_of(
         tmp_path,
         [
             batch(at(6), status="failed"),
             batch(at(10)),  # 相鄰槽的成功批次不借用
         ],
     )
-    assert select_batch(records, SLOT) is None
+    assert select_batch(log, SLOT) is None
 
 
 def test_select_uses_deduplicated_records(tmp_path):
     # 同一 batch_id 第一筆為 failed，後面的 success 重複紀錄不得覆蓋
-    records = records_of(
+    log = log_of(
         tmp_path,
         [
             batch(at(8), batch_id="dup", status="failed"),
@@ -343,19 +343,58 @@ def test_select_uses_deduplicated_records(tmp_path):
             batch(at(6), batch_id="other"),
         ],
     )
-    assert select_batch(records, SLOT).batch_id == "other"
+    assert select_batch(log, SLOT).batch_id == "other"
 
 
 def test_select_accepts_slot_in_other_timezone(tmp_path):
-    records = records_of(tmp_path, [batch(at(6))])
+    log = log_of(tmp_path, [batch(at(6))])
     taipei_slot = SLOT.astimezone(TAIPEI)
-    assert select_batch(records, taipei_slot).fetched_at == at(6)
+    assert select_batch(log, taipei_slot).fetched_at == at(6)
 
 
 def test_select_rejects_unaligned_slot(tmp_path):
-    records = records_of(tmp_path, [batch(at(6))])
+    log = log_of(tmp_path, [batch(at(6))])
     with pytest.raises(ValueError):
-        select_batch(records, at(6))
+        select_batch(log, at(6))
+
+
+def test_select_requires_batch_log(tmp_path):
+    # 不接受任意 list：避免呼叫端略過 read_batch_log 的去重
+    records = list(log_of(tmp_path, [batch(at(6))]).records)
+    with pytest.raises(TypeError):
+        select_batch(records, SLOT)
+
+
+def test_batch_log_rejects_duplicate_batch_id(tmp_path):
+    (failed,) = log_of(
+        tmp_path, [batch(at(8), batch_id="dup", status="failed")]
+    ).records
+    (success,) = log_of(tmp_path, [batch(at(8), batch_id="dup")]).records
+
+    with pytest.raises(ValueError, match="duplicate"):
+        BatchLog(records=(failed, success), bad_lines=0, duplicate_ids=0)
+
+
+def test_batch_log_rejects_non_record_items(tmp_path):
+    with pytest.raises(TypeError):
+        BatchLog(records=(batch(at(6)),), bad_lines=0, duplicate_ids=0)
+    with pytest.raises(TypeError):
+        BatchLog(records=[], bad_lines=0, duplicate_ids=0)
+
+
+def test_duplicate_success_after_failed_is_never_selected(tmp_path):
+    # 回歸測試：重複紀錄夾在中間、且比第一筆更晚，仍以第一筆（failed）為準
+    log = log_of(
+        tmp_path,
+        [
+            batch(at(6), batch_id="dup", status="failed"),
+            batch(at(7), batch_id="other"),
+            batch(at(9), batch_id="dup", status="success"),
+        ],
+    )
+
+    assert log.duplicate_ids == 1
+    assert select_batch(log, SLOT).batch_id == "other"
 
 
 # ================================================================ 原始檔
@@ -568,7 +607,7 @@ def test_run_counts_rejects_bad_values(kwargs):
 
 
 def chosen_batch(tmp_path):
-    (record,) = records_of(tmp_path, [batch(at(6, 1, 500000))])
+    (record,) = log_of(tmp_path, [batch(at(6, 1, 500000))]).records
     return record
 
 
@@ -715,6 +754,47 @@ def test_format_report_is_one_line_json(tmp_path):
     assert "\n" not in line
     assert json.loads(line) == report
     assert "營運中站點全數過期" in line  # 中文不轉成 \\u 跳脫
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda c: setattr(c, "written_valid", -1),
+        lambda c: setattr(c, "existing", True),
+        lambda c: setattr(c, "skipped", 1.5),
+        lambda c: setattr(c, "failed", None),
+        lambda c: c.written_invalid.update({"unknown_reason": 1}),
+        lambda c: c.written_invalid.update({"stale": -2}),
+        lambda c: setattr(c, "written_invalid", [("stale", 1)]),
+    ],
+)
+def test_counts_modified_after_init_are_rejected(tmp_path, mutate):
+    c = counts(written_valid=10, written_invalid={"stale": 1})
+    mutate(c)
+
+    with pytest.raises((ValueError, TypeError)):
+        classify_result(c, batch_found=True)
+    with pytest.raises((ValueError, TypeError)):
+        build_report(SLOT, c, batch=chosen_batch(tmp_path), source=job.SOURCE_JSONL)
+
+
+def test_report_does_not_share_state_with_counts(tmp_path):
+    c = counts(written_valid=10, written_invalid={"stale": 1})
+    report = build_report(
+        SLOT, c, batch=chosen_batch(tmp_path), source=job.SOURCE_JSONL
+    )
+
+    c.written_valid = 99
+    c.written_invalid["stale"] = 50
+
+    assert report["counts"]["written_valid"] == 10
+    assert report["counts"]["written_invalid"] == {"stale": 1}
+
+
+def test_default_counts_are_not_shared_between_instances():
+    a, b = counts(), counts()
+    a.written_invalid["stale"] = 1
+    assert b.written_invalid == {}
 
 
 # ================================================================ 不讀取目前時間

@@ -137,11 +137,23 @@ class BatchLog:
 
     - bad_lines：無法解析或欄位不合法而略過的行（不含空行）。
     - duplicate_ids：與前面某筆有效紀錄 batch_id 相同而略過的行。
+
+    建立時檢查 batch_id 不重複：select_batch 只接受 BatchLog，
+    因此挑選批次時一定是去重後的資料。「保留第一筆」由 read_batch_log 負責。
     """
 
     records: tuple[BatchRecord, ...]
     bad_lines: int
     duplicate_ids: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.records, tuple) or not all(
+            isinstance(r, BatchRecord) for r in self.records
+        ):
+            raise TypeError("records must be a tuple of BatchRecord")
+        ids = [r.batch_id for r in self.records]
+        if len(ids) != len(set(ids)):
+            raise ValueError("BatchLog.records contains duplicate batch_id")
 
 
 def _optional_str(value) -> str | None:
@@ -233,17 +245,22 @@ def read_batch_log(path: Path) -> BatchLog:
     )
 
 
-def select_batch(records, slot: datetime) -> BatchRecord | None:
+def select_batch(log: BatchLog, slot: datetime) -> BatchRecord | None:
     """零快照的槽：挑槽內 status = success 中 fetched_at 最新者。
 
     fetched_at 相同時依 batch_id 排序取最後一個。槽內沒有成功批次時回傳 None
     （之後回報 no_batch），不借用相鄰槽的批次。
-    records 應為 read_batch_log 去重後的結果。
+    只接受 read_batch_log 回傳的 BatchLog（已去重），不接受任意 list，
+    避免呼叫端略過去重，讓後面的重複紀錄覆蓋第一筆。
     """
+    if not isinstance(log, BatchLog):
+        raise TypeError("select_batch requires a BatchLog from read_batch_log")
     slot = _to_utc(slot, "slot")
     if not is_slot_start(slot):
         raise ValueError(f"slot is not aligned to 5 minutes: {slot.isoformat()}")
-    candidates = [r for r in records if r.status == STATUS_SUCCESS and r.slot == slot]
+    candidates = [
+        r for r in log.records if r.status == STATUS_SUCCESS and r.slot == slot
+    ]
     if not candidates:
         return None
     return max(candidates, key=lambda r: (r.fetched_at, r.batch_id))
@@ -265,6 +282,11 @@ def resolve_raw_path(data_dir: Path, raw_path: str) -> Path:
     raw_path 是相對於資料目錄的 POSIX 路徑（collect.py 的格式）。
     絕對路徑、含 `..` 而跑出資料目錄、或經由符號連結指到目錄外，
     一律拋出 RawBatchError。
+
+    已知限制（檢查後替換）：檢查路徑與實際開檔之間，若有人把檔案換成指向
+    目錄外的符號連結，仍可能讀到外部檔案。能這麼做的人必須已經可以寫入資料目錄；
+    VM 上資料目錄權限為 700、只有專用的 youbike 使用者可寫，且讀到的內容
+    仍須通過 parse_stations 與解壓上限，因此不另外以 O_NOFOLLOW 等方式處理。
     """
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise RawBatchError("raw_path is empty")
@@ -321,6 +343,15 @@ class RunCounts:
     failed: int = 0
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """檢查所有計數（型別錯誤拋 TypeError，數值不合法拋 ValueError）。
+
+        初始化時檢查一次，分類與輸出報告前再檢查一次，
+        避免建立後被改成負數、bool 或未知原因代碼的值進入報告。"""
+        if not isinstance(self.written_invalid, dict):
+            raise TypeError("written_invalid must be a dict")
         for name in ("written_valid", "existing", "skipped", "failed"):
             _check_count(name, getattr(self, name))
         for reason, count in self.written_invalid.items():
@@ -356,7 +387,10 @@ def classify_result(
     3. 選到批次但沒有任何快照保留（寫入與已存在都是 0）→ failed。
     4. 有跳過或失敗 → partial（此時必定至少一站已寫入或已存在）。
     5. 其餘 → success。純重跑、全部已存在也算 success。
+
+    判斷前重新檢查計數；不合法時拋出 ValueError。
     """
+    counts.validate()
     if error is not None:
         return RESULT_FAILED
     if not batch_found:
