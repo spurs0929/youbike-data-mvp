@@ -184,6 +184,24 @@ def test_get_station_dto_fields(db, repo):
     )
 
 
+def test_times_are_utc_even_if_session_time_zone_differs(db, repo):
+    # psycopg 會依連線時區回傳 timestamptz；本機 PostgreSQL 常為 Asia/Taipei
+    db.execute("SET TIME ZONE 'Asia/Taipei'")
+    lat, lng = TAIPEI_101
+    add_station(db, "S1", "捷運站", *offset(lat, lng, north_m=10))
+    add_snapshot(db, "S1", fresh(2))
+    results = [
+        repo.get_station("S1"),
+        *repo.search_by_name("捷運"),
+        *repo.find_nearby(lat, lng),
+    ]
+    assert len(results) == 3
+    for status in results:
+        assert status.slot_time == slot_of(fresh(2))
+        assert status.slot_time.utcoffset() == timedelta(0)
+        assert status.info_time.utcoffset() == timedelta(0)
+
+
 def test_window_boundary_exactly_30_minutes_is_included(db, repo):
     add_station(db, "S1")
     add_snapshot(db, "S1", NOW - FRESHNESS_WINDOW)

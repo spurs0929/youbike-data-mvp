@@ -240,8 +240,19 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    # psycopg 依連線的 TimeZone 設定回傳 timestamptz（例如 Asia/Taipei）；
+    # DTO 約定時間欄位一律為 UTC，因此在這裡統一轉換，不依賴資料庫設定。
+    return None if value is None else value.astimezone(timezone.utc)
+
+
 def _row_to_status(row) -> StationStatus:
-    return StationStatus(*row)
+    status = StationStatus(*row)
+    return replace(
+        status,
+        info_time=_as_utc(status.info_time),
+        slot_time=_as_utc(status.slot_time),
+    )
 
 
 class PostgresStationRepository:
