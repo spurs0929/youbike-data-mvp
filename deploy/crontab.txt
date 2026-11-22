@@ -1,4 +1,4 @@
-# YouBike D0 排程：安裝到專用使用者 youbike 的 crontab（不是 root）
+# YouBike 排程（D0 擷取、D1-a 快照）：安裝到專用使用者 youbike 的 crontab（不是 root）
 #   sudo crontab -u youbike /home/youbike/youbike-data-mvp/deploy/crontab.txt
 #
 # - VM 系統時區維持 UTC，cron 以 UTC 解讀（定版 v1.3 11.2）。
@@ -6,13 +6,22 @@
 #   VM 上不得另外執行 collect.py --loop，也不要在 cron 運作中手動執行 collect.py。
 # - 健康檢查只讀檔，不受鎖限制。
 # - cron 不會展開變數裡的變數，路徑一律寫完整。
+# - crontab 裡的 % 有特殊意義（換行），指令中的 % 一律寫成 \%。
 
 SHELL=/bin/sh
 PATH=/usr/local/bin:/usr/bin:/bin
 YOUBIKE_DATA_DIR=/home/youbike/data
+# 本機 Unix socket＋peer 驗證（系統使用者 youbike → 資料庫角色 youbike），不含密碼
+YOUBIKE_DATABASE_URL=postgresql:///youbike
 
 # 每分鐘擷取一次
 * * * * * cd /home/youbike/youbike-data-mvp && flock -n /home/youbike/collect.lock .venv/bin/python src/collect.py >> /home/youbike/logs/collect.log 2>&1
 
 # 每 5 分鐘健康檢查：最近成功擷取（> 10 分鐘警告）＋磁碟使用率（>= 80% 警告）
 */5 * * * * cd /home/youbike/youbike-data-mvp && .venv/bin/python deploy/check_health.py >> /home/youbike/logs/health.log 2>&1
+
+# 每 5 分鐘的第 1 分鐘（第 1、6、11…56 分）處理最近一個已結束的槽（4C）。
+# 例：00:06 處理 [00:00, 00:05)。晚 1 分鐘，讓槽內最後一批（約 00:04 開始）的 JSONL 先寫入。
+# flock -n：上一次 4C 還沒結束就跳過（同槽互斥另由資料庫的同槽鎖保證）。
+# -E 75：只有「被鎖擋下」時結束碼為 75，此時另寫一行 skipped；4C 本身失敗（結束碼 1）不會被誤記為 skipped。
+1-59/5 * * * * cd /home/youbike/youbike-data-mvp && flock -n -E 75 /home/youbike/snapshot.lock .venv/bin/python src/snapshot_job.py >> /home/youbike/logs/snapshot.log 2>&1; [ $? -ne 75 ] || echo "$(date -u +\%Y-\%m-\%dT\%H:\%M:\%SZ) skipped: previous snapshot_job still running" >> /home/youbike/logs/snapshot.log
