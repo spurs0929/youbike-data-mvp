@@ -285,15 +285,39 @@ def test_works_with_non_autocommit_connection(schema, db):
 
 
 def test_search_is_case_insensitive(db, repo):
-    # 只比對集合：大小寫字母的排序依資料庫 collation 而定，本機與雲端可能不同
+    # 排序以 COLLATE "C" 比較：大寫 Y（0x59）在小寫 y（0x79）之前，與資料庫 collation 無關
     for sid, name in [
-        ("3", "YouBike2.0_捷運B站"),
         ("1", "youbike2.0_捷運A站"),
+        ("3", "YouBike2.0_捷運B站"),
         ("2", "其他"),
     ]:
         add_station(db, sid, name=name)
         add_snapshot(db, sid, fresh())
-    assert {s.station_id for s in repo.search_by_name("YOUBIKE")} == {"1", "3"}
+    assert [s.station_id for s in repo.search_by_name("YOUBIKE")] == ["3", "1"]
+
+
+# 都含「站」；碼位順序與常見 collation（中文筆畫／注音、ICU、en_US）的順序不同
+MIXED_NAMES = [
+    "臺北101站",
+    "捷運市政府站",
+    "大安森林公園站",
+    "一壽橋站",
+    "abc站",
+    "ABC站",
+    "Ａ全形站",
+    "_底線站",
+]
+
+
+def test_search_order_is_unicode_code_point_order(db, repo):
+    # 不論資料庫 collation 是什麼，順序都必須等於 Python 的 str 排序；
+    # 有筆數上限時，回傳哪幾站也由這個順序決定
+    for i, name in enumerate(MIXED_NAMES):
+        add_station(db, f"S{i}", name=name)
+        add_snapshot(db, f"S{i}", fresh())
+    expected = [f"S{MIXED_NAMES.index(n)}" for n in sorted(MIXED_NAMES)]
+    assert [s.station_id for s in repo.search_by_name("站", 20)] == expected
+    assert [s.station_id for s in repo.search_by_name("站", 3)] == expected[:3]
 
 
 def test_search_orders_by_name_then_station_id(db, repo):
@@ -478,3 +502,16 @@ def test_in_memory_repository_matches_postgres(db, repo):
             [s.distance_m for s in expected]
         )
     assert mock.get_station("S05") == repo.get_station("S05")
+
+
+def test_in_memory_repository_matches_postgres_with_mixed_names(db, repo):
+    # 中文、全形、大小寫混合的站名：兩邊的排序與筆數上限截取結果都必須相同
+    for i, name in enumerate(MIXED_NAMES):
+        add_station(db, f"S{i}", name=name)
+        add_snapshot(db, f"S{i}", fresh())
+    statuses = [repo.get_station(f"S{i}") for i in range(len(MIXED_NAMES))]
+    mock = InMemoryStationRepository(statuses)
+    for keyword, limit in [("站", 20), ("站", 3), ("abc", 20), ("捷運", 5)]:
+        assert [s.station_id for s in mock.search_by_name(keyword, limit)] == [
+            s.station_id for s in repo.search_by_name(keyword, limit)
+        ]

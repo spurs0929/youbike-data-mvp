@@ -82,7 +82,7 @@ class StationRepository(Protocol):
     def search_by_name(
         self, keyword: str, limit: int = DEFAULT_LIMIT
     ) -> list[StationStatus]:
-        """站名包含 keyword（不分大小寫）的站，依站名、站號排序。"""
+        """站名包含 keyword（不分大小寫）的站，依站名、站號排序（以 Unicode 碼位比較）。"""
         ...
 
     def find_nearby(
@@ -295,7 +295,11 @@ class PostgresStationRepository:
         rows = self._query(
             _WHERE_NAME,
             {"pattern": f"%{escape_like(text)}%", "limit": limit},
-            "ORDER BY s.station_name, s.station_id LIMIT %(limit)s",
+            # COLLATE "C"：依 UTF-8 位元組（＝Unicode 碼位）比較，與 Python 的 str 排序一致，
+            # 不受資料庫 collation 影響；否則本機（Windows）與 VM 的中文站名順序可能不同，
+            # 有筆數上限時連回傳哪些站都會不同。
+            'ORDER BY s.station_name COLLATE "C", s.station_id COLLATE "C"'
+            " LIMIT %(limit)s",
         )
         return [_row_to_status(row) for row in rows]
 
@@ -338,8 +342,13 @@ class InMemoryStationRepository:
 
     傳入的每筆 StationStatus 視為該站「已通過 30 分鐘視窗的最新快照」，
     因此不再判斷視窗。參數驗證、搜尋與距離規則和 PostgreSQL 實作共用同一套函式：
-    - 站名搜尋：不分大小寫的子字串比對，%、_、\\ 都是一般文字；依站名、站號排序。
+    - 站名搜尋：不分大小寫的子字串比對，%、_、\\ 都是一般文字；依站名、站號排序
+      （以 Unicode 碼位比較，與 PostgreSQL 版的 COLLATE "C" 一致）。
     - 附近查詢：haversine 距離 <= 半徑；依距離、站號排序；沒有座標的站不回傳。
+
+    站名比對是近似實作：Mock 用 str.casefold()，PostgreSQL 用 ILIKE（依資料庫的
+    字元分類轉小寫）。中文與 ASCII 字母兩者結果相同，少數特殊字元（例如德文 ß）可能不同。
+    搜尋語意以 PostgreSQL 版與其整合測試為準。
     """
 
     def __init__(self, stations: Iterable[StationStatus] = ()):
