@@ -1,0 +1,12 @@
+// YouBike D1-b：讓 unattended-upgrades 也自動更新 Caddy（官方 Cloudsmith 套件庫）
+// 安裝到 /etc/apt/apt.conf.d/52unattended-upgrades-caddy（擁有者 root、權限 644）：
+//   sudo install -m 644 -o root -g root deploy/unattended-upgrades-caddy /etc/apt/apt.conf.d/52unattended-upgrades-caddy
+//
+// Ubuntu 預設只自動安裝 Ubuntu 套件庫的安全更新（/etc/apt/apt.conf.d/50unattended-upgrades）。
+// Caddy 來自另一個套件庫，必須另外加入；這裡的清單會附加到預設清單後面，不會取代它。
+// origin 必須與 `apt-cache policy caddy` 顯示的 o= 值相同，安裝後以
+//   sudo unattended-upgrade --dry-run --debug 2>&1 | grep -i caddy
+// 確認有被列入。
+Unattended-Upgrade::Origins-Pattern {
+        "origin=cloudsmith/caddy/stable";
+};

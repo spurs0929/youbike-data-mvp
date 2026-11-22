@@ -1,0 +1,26 @@
+# YouBike D1-b：Caddy 設定（HTTPS 入口）
+# 安裝到 /etc/caddy/Caddyfile（擁有者 root、權限 644）：
+#   sudo install -m 644 -o root -g root deploy/Caddyfile /etc/caddy/Caddyfile
+#   sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+#
+# - D1-b 只提供健康檢查：/healthz 回 200「ok」，其他路徑一律回 404（內容為空）。
+#   這只代表 Caddy 與 HTTPS 正常，不代表 FastAPI 或資料庫已上線。
+# - HTTPS 憑證由 Caddy 自動向 Let's Encrypt 申請與續期（HTTP-01 驗證，需要 80 port）。
+#   不使用 DuckDNS 的 API，VM 上不需要 DuckDNS Token。
+# - 不開 access log；Caddy 本身的日誌寫到 journald（上限見 deploy/journald-youbike.conf）。
+# - 管理介面維持預設 localhost:2019（只有本機可連），systemctl reload 需要它。
+# - 之後的 FastAPI 只綁定 127.0.0.1，由這裡轉送；PostgreSQL 維持只用 Unix socket。
+
+youbike-data-mvp.duckdns.org {
+	# 不回傳 Server 標頭（避免透露伺服器軟體）
+	header -Server
+
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	# 其他所有路徑：404，內容為空
+	handle {
+		respond 404
+	}
+}

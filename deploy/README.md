@@ -1,6 +1,6 @@
 # 部署（GCP e2-micro）：D0 最小擷取、D1 完整部署
 
-> **D1-a（PostgreSQL 與 4C 排程）見文末〈D1-a〉一節。** 以下到〈更新程式〉為止是 D0 的內容與紀錄。
+> **D1-a（PostgreSQL 與 4C 排程）、D1-b（固定 IP、網域、Caddy HTTPS）見文末各節。** 以下到〈更新程式〉為止是 D0 的內容與紀錄。
 
 依《YouBike 2.0 專案設計定版 v1.3》11.2。只部署既有的 `collect.py`＋cron＋`flock`，
 目的是提早累積平日尖峰、離峰與週末的真實資料。
@@ -19,6 +19,8 @@
 | `journald-youbike.conf` | `/etc/systemd/journald.conf.d/youbike.conf` | 系統日誌保留 14 天、最多 200 MB |
 | `env.example` | 不安裝 | 環境變數說明（`YOUBIKE_DATA_DIR`；D1-a 起加上 `YOUBIKE_DATABASE_URL`） |
 | `postgresql-youbike.conf` | `/etc/postgresql/16/main/conf.d/youbike.conf` | D1-a：只用 Unix socket、`max_connections`、`shared_buffers` |
+| `Caddyfile` | `/etc/caddy/Caddyfile` | D1-b：HTTPS 入口，只有 `/healthz`，其他路徑 404 |
+| `unattended-upgrades-caddy` | `/etc/apt/apt.conf.d/52unattended-upgrades-caddy` | D1-b：讓 Caddy 也納入自動更新 |
 
 ## VM 規格（2026-11-20 建立）
 
@@ -340,14 +342,166 @@ sudo crontab -u youbike -l | grep -v '^#' | grep -v '^$'
 6. **版本紀錄**：記下 VM 上的 Python、pandas、psycopg、PostgreSQL 版本（下方表格）。
    依賴版本的可重現性（本機與 VM 的 pandas 主版本不同）在 12/6 封板前處理。
 
-### D1-a 驗收紀錄
+### D1-a 驗收紀錄（2026-11-22，通過）
+
+部署版本：`80d209c`。
 
 | 項目 | 結果 | 時間（UTC） |
 |---|---|---|
-| 安裝前基準 | 待填 | — |
-| PostgreSQL 版本、設定 | 待填 | — |
-| 4C 手動執行（結果、最大記憶體） | 待填 | — |
-| 連續 1 小時 12 個槽 | 待填 | — |
-| 站點數核對 | 待填 | — |
-| 記憶體、OOM | 待填 | — |
-| 版本（Python／pandas／psycopg） | 待填 | — |
+| 安裝前基準 | available 640 MB、swap 已用 22 MB、磁碟 17%（4.6G）；擷取 `ok`、健康檢查 `OK` | 06:50 |
+| PostgreSQL 安裝 | 16.15（Ubuntu 16.15-0ubuntu0.24.04.1）；預設設定時 available 625 MB、swap 41 MB（apt 安裝時增加） | 06:53 |
+| PostgreSQL 設定 | `listen_addresses` 空白、`max_connections` 20、`shared_buffers` 128 MB；TCP 5432 監聽數 0；available 回到 640 MB | 06:54 |
+| 角色與資料庫 | peer 連線成功、不需密碼；角色 `youbike` 非超級使用者、不能建資料庫與角色、沒有密碼 | 06:55 |
+| migration | 四張表建立，擁有者 `youbike` | 06:56 |
+| 4C 手動執行 | 槽 06:50、`success`、有效 1,805、`inactive` 21；耗時 5.82 秒；**最大記憶體 98,904 kB（約 96.6 MB）** | 06:57 |
+| 安裝 crontab | 三行排程；07:01 第一次自動執行 `success`（槽 06:55，挑到槽內最後一批 06:59） | 06:58 |
+| 連續 1 小時 12 個槽 | 槽 06:55～07:50 由 cron 執行，12 次全部 `success`；`Traceback` 0；沒有 flock 跳過紀錄 | 07:01～07:56 |
+| 站點數核對 | 13 個槽（含手動的 06:50）每槽快照數 1,826 ＝ 來源批次 `station_count` 1,826；有效 1,805；每槽各一個來源批次，皆為槽內最後一批 | 07:58 |
+| 擷取不受影響 | `collect.log` 持續 `ok`；`health.log` 皆 `OK`；`WARN` 仍只有 D0 的 1 筆 | 07:58 |
+| 4C 執行中記憶體 | 07:16 取樣（與擷取同時執行）：available 623 → 577 MB 仍在下降時取樣結束；swap 維持 44 MB | 07:16 |
+| 記憶體、磁碟、OOM | available 634 MB、swap 已用 46 MB、磁碟 18%（4.9G）；OOM 0 次（06:50 起） | 07:58 |
+| 版本 | Python 3.12.3、pandas 3.1.1、psycopg 3.3.9、PostgreSQL 16.15 | 07:58 |
+
+- `snapshot.log` 只記錄 cron 的執行；D1-7 手動執行的結果輸出在終端機，所以日誌有 12 筆、資料庫有 13 個槽。
+- **依賴版本**：VM 為 pandas 3.1.1，本機（Python 3.10）無法安裝 pandas 3。4C 已在 VM 的 pandas 3.1.1 以真實資料驗證；
+  依賴版本的可重現性在 12/6 封板前處理。
+
+---
+
+## D1-b：固定 IP、網域、Caddy HTTPS
+
+依定版 v1.3 11.3。D1-a 驗收通過後才開始。
+
+### 設計
+
+| 項目 | 決定 |
+|---|---|
+| 網域 | `youbike-data-mvp.duckdns.org`（DuckDNS） |
+| IP | 把 VM 原本的臨時外部 IP 升級為固定 IP（位址不變） |
+| DNS 更新 | 在 DuckDNS 網站**手動設定一次** IP。IP 固定，不需要自動更新，**VM 上不放 DuckDNS Token，也不裝更新腳本** |
+| 憑證 | Caddy 自動向 Let's Encrypt 申請與續期，HTTP-01 驗證（需要 80 port），不用 DuckDNS API |
+| 對外內容 | 只有 `/healthz` 回 200 `ok`；其他路徑 404、內容為空；移除 `Server` 標頭；不開 access log |
+| 內部服務 | PostgreSQL 只用 Unix socket；之後 FastAPI 只綁 `127.0.0.1`，一律由 Caddy 對外 |
+| 日誌 | Caddy 只寫 journald（200 MB、14 天上限，`journald-youbike.conf`），不產生額外日誌檔 |
+| 安全更新 | Ubuntu 的 `unattended-upgrades`；Caddy 來自官方 Cloudsmith 套件庫，另外加入自動更新清單 |
+| 防火牆 | 開放 80、443（GCP 的 `http-server`、`https-server` 網路標記）；SSH 另見 D1-c |
+
+**限制**：80 port 自動轉 HTTPS 的回應仍會帶 `Server: Caddy`（不含版本號），`header -Server` 管不到這個自動產生的轉址。
+
+`/healthz` 正常只代表 Caddy 與 HTTPS 正常，**不代表** FastAPI 或資料庫服務已上線。
+
+### 費用與停機注意事項
+
+- Compute Engine 免費方案不對外部 IP 收費（e2-micro 在免費方案內時）；以 Billing 報表依 SKU 確認。
+- **保留了固定 IP 但沒有接在 VM 上時會收費，且費率比使用中更高**。停機或刪除 VM 時，要一併**釋放固定 IP**。
+- **預算警示（NT$30）只寄通知，不是費用上限**，不會自動停機或停止計費。
+
+### 安裝步驟
+
+修改系統或雲端設定的步驟，**一次只做一步**，確認結果後再做下一步。
+
+#### B-1. 臨時 IP 升級為固定 IP（GCP Console）
+
+VPC 網路 →「IP 位址」→ 找到 `youbike-vm` 使用的外部 IP →「升級為靜態 IP 位址」，名稱 `youbike-ip`。位址不變，VM 不需重新啟動。
+
+#### B-2. DuckDNS 設定 IP（DuckDNS 網站）
+
+在 `youbike-data-mvp` 那一列的 `current ip` 填入 B-1 的 IP，按「update ip」。**Token 只留在 DuckDNS 網站，不複製到任何地方。**
+
+#### B-3. 確認網域解析
+
+```bash
+getent hosts youbike-data-mvp.duckdns.org
+curl -s -4 https://ifconfig.me; echo
+```
+
+兩行的 IP 必須相同（第二行是 VM 實際對外的 IP）。
+
+#### B-4. 確認 Ubuntu 自動安全更新
+
+```bash
+dpkg -l unattended-upgrades | tail -1
+systemctl is-enabled unattended-upgrades
+cat /etc/apt/apt.conf.d/20auto-upgrades
+```
+
+應為已安裝（`ii`）、`enabled`，且兩行設定值都是 `"1"`。
+
+#### B-5. 安裝 Caddy（官方套件庫）並先停止
+
+```bash
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update && sudo apt install -y caddy
+sudo systemctl stop caddy
+caddy version
+apt-cache policy caddy | head -4
+```
+
+安裝後先停止：套件附的預設設定會在 80 port 提供歡迎頁，換成本 repo 的設定前不讓它對外。
+
+#### B-6. 加入 Caddy 自動更新
+
+```bash
+sudo install -m 644 -o root -g root /home/youbike/youbike-data-mvp/deploy/unattended-upgrades-caddy /etc/apt/apt.conf.d/52unattended-upgrades-caddy
+sudo unattended-upgrade --dry-run --debug 2>&1 | grep -iE "allowed origins|caddy" | head -5
+```
+
+`Allowed origins` 那一行要包含 `origin=cloudsmith/caddy/stable`。
+
+#### B-7. 安裝 Caddyfile 並檢查
+
+```bash
+sudo install -m 644 -o root -g root /home/youbike/youbike-data-mvp/deploy/Caddyfile /etc/caddy/Caddyfile
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+```
+
+最後應出現 `Valid configuration`。
+
+#### B-8. 開放 80、443（GCP Console）
+
+VM 執行個體 →「編輯」→「網路」→ 勾選「允許 HTTP 流量」「允許 HTTPS 流量」→ 儲存。
+到「防火牆」確認有來源 `0.0.0.0/0`、目標標記 `http-server`（tcp:80）與 `https-server`（tcp:443）的規則。
+
+#### B-9. 啟動 Caddy 並確認取得憑證
+
+```bash
+sudo systemctl start caddy
+sleep 30
+systemctl is-active caddy
+sudo journalctl -u caddy --since "-5 min" --no-pager | grep -iE "certificate obtained|error" | tail -5
+```
+
+應為 `active`，並出現 `certificate obtained successfully`。
+
+### 驗收
+
+【本機 PowerShell】（Windows 內建 `curl.exe`）：
+
+```powershell
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/healthz
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/admin
+curl.exe -s -i http://youbike-data-mvp.duckdns.org/healthz
+```
+
+1. `/healthz`：狀態 200、內容 `ok`、**沒有 `Server` 標頭**。
+2. `/`、`/admin`：狀態 404、內容為空、沒有 `Server` 標頭。
+3. `http://`：狀態 308，`Location` 指向 `https://`。
+4. 憑證：瀏覽器開 `https://youbike-data-mvp.duckdns.org/healthz` 不出現警告；簽發者為 Let's Encrypt。
+5. 續期：由 Caddy 自動處理；日常檢查時以 `journalctl -u caddy | grep -i renew` 確認沒有錯誤。
+6. 內部服務沒有對外：`sudo ss -ltnp` 只有 22、80、443 對外，`127.0.0.1:2019`（Caddy 管理介面）只聽本機，沒有 5432。
+7. **部署後重新驗收 D1-a**：4C 連續成功、`free -m`（available ≥ 200 MB、swap 不持續增加）、`df -h`、OOM 次數為 0。
+
+### D1-b 驗收紀錄
+
+| 項目 | 結果 | 時間（UTC） |
+|---|---|---|
+| 固定 IP | 待填 | — |
+| DNS 解析 | 待填 | — |
+| 自動安全更新（Ubuntu、Caddy） | 待填 | — |
+| Caddy 版本、憑證取得 | 待填 | — |
+| `/healthz`、404、轉址、標頭 | 待填 | — |
+| 對外連接埠 | 待填 | — |
+| 部署後 4C、記憶體、swap、磁碟、OOM | 待填 | — |
