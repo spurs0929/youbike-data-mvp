@@ -24,6 +24,7 @@ import pytest
 from repository import (
     EARTH_RADIUS_M,
     FRESHNESS_WINDOW,
+    InMemoryStationRepository,
     PostgresStationRepository,
     StationStatus,
 )
@@ -446,3 +447,34 @@ def test_nearby_near_pole(db, repo):
 
 def test_nearby_no_match_returns_empty_list(db, repo):
     assert repo.find_nearby(*TAIPEI_101) == []
+
+
+# ================================================================ 與 Mock 一致
+
+
+def test_in_memory_repository_matches_postgres(db, repo):
+    # 同一份資料：Mock 與 PostgreSQL 實作的搜尋與附近查詢結果必須相同
+    # 站名只用相同前綴＋數字，避免排序受資料庫 collation 影響
+    lat, lng = TAIPEI_101
+    for i in range(12):
+        sid = f"S{i:02d}"
+        add_station(db, sid, f"站{i:02d}", *offset(lat, lng, north_m=90 * i, east_m=40))
+        add_snapshot(db, sid, fresh(), valid=i % 3 != 0, reason="stale")
+    statuses = [repo.get_station(f"S{i:02d}") for i in range(12)]
+    mock = InMemoryStationRepository(statuses)
+
+    def key(results):
+        return [(s.station_id, s.is_valid, s.slot_time) for s in results]
+
+    for keyword in ["站", "站0", "站1", "不存在"]:
+        assert key(mock.search_by_name(keyword, 5)) == key(
+            repo.search_by_name(keyword, 5)
+        )
+    for radius in [100.0, 500.0, 3000.0]:
+        expected = repo.find_nearby(lat, lng, radius, 20)
+        actual = mock.find_nearby(lat, lng, radius, 20)
+        assert key(actual) == key(expected)
+        assert [s.distance_m for s in actual] == pytest.approx(
+            [s.distance_m for s in expected]
+        )
+    assert mock.get_station("S05") == repo.get_station("S05")

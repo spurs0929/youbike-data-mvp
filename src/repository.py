@@ -4,6 +4,7 @@
 - `StationRepository`：查詢介面（typing.Protocol）。Mock 實作與 PostgreSQL
   實作遵守相同方法與回傳型別，API 階段只替換實作，不改介面。
 - `PostgresStationRepository`：直接查詢 PostgreSQL 最新快照。
+- `InMemoryStationRepository`：Mock 實作，供 API 與 LLM 工具測試使用，不需要資料庫。
 
 「最新」的定義：
   每站先以主鍵 (station_id, slot_time) 倒序取出最新的一筆快照，再以該快照所屬
@@ -20,10 +21,10 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 # ---------------------------------------------------------------- 常數
 
@@ -72,6 +73,7 @@ class StationStatus:
 # ---------------------------------------------------------------- 介面
 
 
+@runtime_checkable
 class StationRepository(Protocol):
     def get_station(self, station_id: str) -> StationStatus | None:
         """指定站點的最新狀態；查無或沒有視窗內的快照時回傳 None。"""
@@ -321,6 +323,62 @@ class PostgresStationRepository:
         results = []
         for row in rows:
             status = _row_to_status(row)
+            distance = haversine_m(lat, lng, status.latitude, status.longitude)
+            if distance <= radius:
+                results.append(replace(status, distance_m=distance))
+        results.sort(key=lambda s: (s.distance_m, s.station_id))
+        return results[:limit]
+
+
+# ---------------------------------------------------------------- Mock 實作
+
+
+class InMemoryStationRepository:
+    """Mock 實作：資料放在記憶體，不連資料庫。
+
+    傳入的每筆 StationStatus 視為該站「已通過 30 分鐘視窗的最新快照」，
+    因此不再判斷視窗。參數驗證、搜尋與距離規則和 PostgreSQL 實作共用同一套函式：
+    - 站名搜尋：不分大小寫的子字串比對，%、_、\\ 都是一般文字；依站名、站號排序。
+    - 附近查詢：haversine 距離 <= 半徑；依距離、站號排序；沒有座標的站不回傳。
+    """
+
+    def __init__(self, stations: Iterable[StationStatus] = ()):
+        self._stations: dict[str, StationStatus] = {}
+        for status in stations:
+            if status.station_id in self._stations:
+                raise ValueError(f"站號重複：{status.station_id}")
+            self._stations[status.station_id] = replace(status, distance_m=None)
+
+    def get_station(self, station_id: str) -> StationStatus | None:
+        return self._stations.get(validate_station_id(station_id))
+
+    def search_by_name(
+        self, keyword: str, limit: int = DEFAULT_LIMIT
+    ) -> list[StationStatus]:
+        text = validate_keyword(keyword).casefold()
+        limit = validate_limit(limit)
+        found = [
+            s
+            for s in self._stations.values()
+            if s.station_name is not None and text in s.station_name.casefold()
+        ]
+        found.sort(key=lambda s: (s.station_name, s.station_id))
+        return found[:limit]
+
+    def find_nearby(
+        self,
+        latitude: float,
+        longitude: float,
+        radius_m: float = DEFAULT_RADIUS_M,
+        limit: int = DEFAULT_LIMIT,
+    ) -> list[StationStatus]:
+        lat, lng = validate_coordinates(latitude, longitude)
+        radius = validate_radius(radius_m)
+        limit = validate_limit(limit)
+        results = []
+        for status in self._stations.values():
+            if status.latitude is None or status.longitude is None:
+                continue
             distance = haversine_m(lat, lng, status.latitude, status.longitude)
             if distance <= radius:
                 results.append(replace(status, distance_m=distance))

@@ -1,3 +1,6 @@
 -r requirements.txt
 pytest>=8
 ruff>=0.6
+# Required by FastAPI TestClient (Starlette 1.x recommends httpx2 over httpx).
+# Keep requirements files ASCII-only: pip on Windows may read them as cp950.
+httpx2>=2.13
