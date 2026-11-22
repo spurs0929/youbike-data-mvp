@@ -1,11 +1,15 @@
 # 部署（GCP e2-micro）：D0 最小擷取、D1 完整部署
 
-> **D1-a（PostgreSQL 與 4C 排程）、D1-b（固定 IP、網域、Caddy HTTPS）見文末各節。** 以下到〈更新程式〉為止是 D0 的內容與紀錄。
+> **D1-a（PostgreSQL 與 4C 排程）、D1-b（固定 IP、網域、Caddy HTTPS）、D1-c（SSH 只經 IAP）見文末各節。** 以下到〈更新程式〉為止是 D0 的內容與紀錄。
+>
+> **防火牆紀錄更正（2026-11-22）**：D0 時記為「防火牆只開 SSH」有誤。建立 VM 時勾選了「允許 HTTP／HTTPS 流量」，
+> 加上 GCP 預設網路本來就有的規則，實際對外開放的是 SSH（22）、HTTP（80）、HTTPS（443）、RDP（3389）、ICMP。
+> D0 期間 80、443、3389 都沒有程式在聽，沒有資料外露。目前狀態見〈D1-c〉的「防火牆現況」。
 
 依《YouBike 2.0 專案設計定版 v1.3》11.2。只部署既有的 `collect.py`＋cron＋`flock`，
 目的是提早累積平日尖峰、離峰與週末的真實資料。
 
-- 不部署 PostgreSQL、API、Caddy；防火牆只開 SSH。
+- 不部署 PostgreSQL、API、Caddy；80、443 沒有程式在聽（防火牆實際開放範圍見文首更正）。
 - 不修改 `src/`，不改變資料格式（gzip 檔名與內容、JSONL 欄位）。
 - VM 上不放任何密碼、Token 或金鑰。
 
@@ -30,7 +34,7 @@
 | 機型 | e2-micro，佈建模型「標準」（非 Spot） |
 | 作業系統 | Ubuntu 24.04 LTS Minimal（x86/64） |
 | 磁碟 | 標準永久磁碟（pd-standard）30 GB，無快照排程、不備份 |
-| 網路 | 外部 IP 臨時；防火牆不開 HTTP／HTTPS |
+| 網路 | D0 時外部 IP 臨時；D1-b 起改為固定 IP `youbike-ip`（35.230.112.185）。防火牆見文首更正與〈D1-c〉 |
 | 安全性 | 無服務帳戶；不裝 Ops Agent |
 
 Free Tier 只涵蓋 us-west1／us-central1／us-east1 的 e2-micro 與 30 GB 標準永久磁碟；
@@ -400,9 +404,22 @@ sudo crontab -u youbike -l | grep -v '^#' | grep -v '^$'
 
 修改系統或雲端設定的步驟，**一次只做一步**，確認結果後再做下一步。
 
-#### B-1. 臨時 IP 升級為固定 IP（GCP Console）
+#### B-1. 臨時 IP 升級為固定 IP（Cloud Shell）
 
-VPC 網路 →「IP 位址」→ 找到 `youbike-vm` 使用的外部 IP →「升級為靜態 IP 位址」，名稱 `youbike-ip`。位址不變，VM 不需重新啟動。
+Console 選單位置因介面版本不同而難找，改用 Cloud Shell（Console 右上角 `>_`；提示字元含 `cloudshell` 與 `(youbike-mvp)`）。
+先查出目前的外部 IP，再以同一個位址建立固定 IP（GCP 的「升級」做法），位址不變，VM 不需重新啟動：
+
+```bash
+gcloud config set project youbike-mvp
+gcloud compute instances describe youbike-vm --zone=us-west1-b --format='get(networkInterfaces[0].accessConfigs[0].natIP)'
+gcloud compute addresses create youbike-ip --addresses=<上一行的 IP> --region=us-west1
+gcloud compute addresses list
+```
+
+`STATUS` 必須是 `IN_USE`（接在 VM 上）；`RESERVED` 代表沒有接在任何資源上，會以較高費率計費。
+
+> **`gcloud` 只在 Cloud Shell 執行。** VM 沒有服務帳戶，在 VM 上執行會回報沒有帳號；
+> **不要在 VM 上執行 `gcloud auth login`**，否則個人憑證會留在 VM 上。
 
 #### B-2. DuckDNS 設定 IP（DuckDNS 網站）
 
@@ -441,9 +458,12 @@ apt-cache policy caddy | head -4
 
 安裝後先停止：套件附的預設設定會在 80 port 提供歡迎頁，換成本 repo 的設定前不讓它對外。
 
-#### B-6. 加入 Caddy 自動更新
+#### B-6. 更新 repo 並加入 Caddy 自動更新
+
+先把 VM 上的 repo 更新到含本節設定檔的版本（只動 `deploy/` 的文件與設定檔，不影響正在執行的排程）：
 
 ```bash
+sudo -iu youbike bash -c 'cd youbike-data-mvp && git pull --ff-only && git log -1 --oneline && git status --short'
 sudo install -m 644 -o root -g root /home/youbike/youbike-data-mvp/deploy/unattended-upgrades-caddy /etc/apt/apt.conf.d/52unattended-upgrades-caddy
 sudo unattended-upgrade --dry-run --debug 2>&1 | grep -iE "allowed origins|caddy" | head -5
 ```
@@ -459,10 +479,16 @@ sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
 最後應出現 `Valid configuration`。
 
-#### B-8. 開放 80、443（GCP Console）
+#### B-8. 確認 80、443 已開放（Cloud Shell）
 
-VM 執行個體 →「編輯」→「網路」→ 勾選「允許 HTTP 流量」「允許 HTTPS 流量」→ 儲存。
-到「防火牆」確認有來源 `0.0.0.0/0`、目標標記 `http-server`（tcp:80）與 `https-server`（tcp:443）的規則。
+```bash
+gcloud compute instances describe youbike-vm --zone=us-west1-b --format="value(networkInterfaces[0].network.basename(), tags.items)"
+gcloud compute firewall-rules list --format="table(name, network.basename(), direction, sourceRanges.list(), allowed[].map().firewall_rule().list(), targetTags.list(), disabled)"
+```
+
+VM 須有 `http-server`、`https-server` 標記，並有啟用中的 `default-allow-http`（tcp:80）、`default-allow-https`（tcp:443）。
+11/22 實際檢查時兩者都已存在（建立 VM 時已勾選），不需修改。
+若沒有，到 VM 執行個體 →「編輯」→ 勾選「允許 HTTP 流量」「允許 HTTPS 流量」→ 儲存。
 
 #### B-9. 啟動 Caddy 並確認取得憑證
 
@@ -494,14 +520,87 @@ curl.exe -s -i http://youbike-data-mvp.duckdns.org/healthz
 6. 內部服務沒有對外：`sudo ss -ltnp` 只有 22、80、443 對外，`127.0.0.1:2019`（Caddy 管理介面）只聽本機，沒有 5432。
 7. **部署後重新驗收 D1-a**：4C 連續成功、`free -m`（available ≥ 200 MB、swap 不持續增加）、`df -h`、OOM 次數為 0。
 
-### D1-b 驗收紀錄
+### D1-b 驗收紀錄（2026-11-22，通過）
+
+部署版本：`8ccd404`。
 
 | 項目 | 結果 | 時間（UTC） |
 |---|---|---|
-| 固定 IP | 待填 | — |
-| DNS 解析 | 待填 | — |
-| 自動安全更新（Ubuntu、Caddy） | 待填 | — |
-| Caddy 版本、憑證取得 | 待填 | — |
-| `/healthz`、404、轉址、標頭 | 待填 | — |
-| 對外連接埠 | 待填 | — |
-| 部署後 4C、記憶體、swap、磁碟、OOM | 待填 | — |
+| 固定 IP | `youbike-ip` = 35.230.112.185，`IN_USE`（由原臨時 IP 升級，位址不變） | 08:14 |
+| DNS 解析 | DuckDNS 手動設定 IP；VM 上 `getent hosts` 與實際對外 IP 皆為 35.230.112.185；VM 上沒有 Token | 08:16 |
+| Ubuntu 自動安全更新 | `unattended-upgrades` 2.9.1 已安裝、`enabled`，兩項 Periodic 設定為 `"1"`，每日排程正常 | 08:16 |
+| Caddy 安裝 | v2.11.9（官方 Cloudsmith 套件庫，來源 `o=cloudsmith/caddy/stable`），安裝後立即停止 | 08:18 |
+| Caddy 自動更新 | `Allowed origins` 在 Ubuntu 預設 4 項後加入 `origin=cloudsmith/caddy/stable` | 08:19 |
+| Caddyfile | `Valid configuration`，無格式警告 | 08:20 |
+| 防火牆 80、443 | 建立 VM 時已開放（`default-allow-http`／`https`），未修改 | 08:21 |
+| 憑證 | 08:22:11 啟動、08:22:19 `certificate obtained successfully`；簽發者 Let's Encrypt（YE2），到期 2027-02-20，由 Caddy 自動續期 | 08:22 |
+| 監聽連接埠 | `*:80`、`*:443`（caddy）；`127.0.0.1:2019`（Caddy 管理介面，只限本機）；沒有 5432 | 08:22 |
+| 外部測試（本機 `curl.exe`） | `/healthz` 200、內容 `ok`、無 `Server` 標頭；`/`、`/admin` 404、內容為空、無 `Server`；`http://` 308 轉 `https://`（帶 `Server: Caddy`，無版本號，屬已知限制）；回應帶 `Alt-Svc: h3`，UDP 443 未開放時瀏覽器自動退回 HTTPS | 10:52 |
+| 部署後 4C | 08:20～10:45 共 30 槽、每槽快照數等於來源站數；`snapshot.log` 47 行全為 `success`（D1-a 起每次 cron 皆成功） | 10:53 |
+| 部署後資源 | available 636 MB；swap 已用 61 MB（2.5 小時增加 14 MB，available 同時穩定，判定為閒置頁面換出，持續觀察）；磁碟 18%（5.0G）；OOM 0 次；Caddy 常駐約 40 MB；journald 24 MB | 10:53 |
+
+**持續觀察**：swap 已用量若一週內持續上升並超過 200 MB，回頭檢查記憶體用量。
+
+---
+
+## D1-c：SSH 只經 IAP
+
+D1-b 開放 80、443 後，把 SSH 從「整個網際網路可連」收斂到只允許 Google IAP 轉送。
+
+### 設計
+
+| 項目 | 決定 |
+|---|---|
+| SSH | 新增 `allow-ssh-from-iap`：只允許 `35.235.240.0/20`（IAP TCP 轉送使用的範圍）連 tcp:22 |
+| 舊規則 | `default-allow-ssh`（0.0.0.0/0 → 22）、`default-allow-rdp`（0.0.0.0/0 → 3389）**停用、不刪除**，需要時可立即恢復 |
+| 登入方式 | Console 的瀏覽器 SSH（實測會自動走 IAP）；或 Cloud Shell 的 `gcloud compute ssh --tunnel-through-iap` |
+| OS Login | 暫緩：單人使用效益低，且會改變登入使用者名稱與家目錄，12/11 後再評估 |
+
+防火牆在 GCP Console／Cloud Shell 修改，不需要 SSH，因此不會被鎖在外面；序列埠主控台為最後備援。
+
+### 步驟（Cloud Shell）
+
+```bash
+# C-1. 新增 IAP 規則，並以 IAP 登入（舊規則仍在，這一步還不能證明新規則有效）
+gcloud compute firewall-rules create allow-ssh-from-iap --network=default --direction=INGRESS --action=allow --rules=tcp:22 --source-ranges=35.235.240.0/20 --description="SSH only via IAP TCP forwarding (D1-c)"
+gcloud compute ssh youbike-vm --zone=us-west1-b --tunnel-through-iap --command="hostname; date -u; whoami"
+
+# C-2. 停用舊規則後再以 IAP 登入（這一步才是真正的驗證）
+gcloud compute firewall-rules update default-allow-ssh --disabled
+gcloud compute firewall-rules update default-allow-rdp --disabled
+sleep 15
+gcloud compute ssh youbike-vm --zone=us-west1-b --tunnel-through-iap --command="hostname; date -u"
+
+# C-3. 不經 IAP 直接連線應被擋下（443 為對照組）
+for p in 22 3389 443; do timeout 8 bash -c "</dev/tcp/35.230.112.185/$p" 2>/dev/null && echo "port $p: OPEN" || echo "port $p: CLOSED"; done
+```
+
+- 第一次執行 `gcloud compute ssh` 時，Cloud Shell 會產生 SSH 金鑰（密語留空，按 Enter 兩次），由 `gcloud` 自動管理，不需記錄。
+- 出現「consider installing NumPy」的提示可忽略（只影響大量傳輸的速度）。
+
+**恢復舊規則**（IAP 無法登入時）：
+
+```bash
+gcloud compute firewall-rules update default-allow-ssh --no-disabled
+```
+
+### 防火牆現況（2026-11-22 D1-c 後）
+
+| 規則 | 來源 | 連接埠 | 狀態 |
+|---|---|---|---|
+| `allow-ssh-from-iap` | 35.235.240.0/20 | tcp:22 | 啟用 |
+| `default-allow-http` | 0.0.0.0/0 | tcp:80（標記 `http-server`） | 啟用 |
+| `default-allow-https` | 0.0.0.0/0 | tcp:443（標記 `https-server`） | 啟用 |
+| `default-allow-icmp` | 0.0.0.0/0 | icmp | 啟用 |
+| `default-allow-internal` | 10.128.0.0/9 | 全部 | 啟用 |
+| `default-allow-ssh` | 0.0.0.0/0 | tcp:22 | **停用** |
+| `default-allow-rdp` | 0.0.0.0/0 | tcp:3389 | **停用** |
+
+### D1-c 驗收紀錄（2026-11-22，通過）
+
+| 項目 | 結果 | 時間（UTC） |
+|---|---|---|
+| C-1 新增規則、IAP 登入 | `allow-ssh-from-iap` 建立；IAP 登入成功（`youbike-vm`、`briankang0929`） | 10:57 |
+| C-2 停用舊規則後 IAP 登入 | `default-allow-ssh`、`default-allow-rdp` 已停用；IAP 登入成功 | 11:02 |
+| C-3 直接連線 | 22 `CLOSED`、3389 `CLOSED`、443 `OPEN`（對照組） | 11:03 |
+| 瀏覽器 SSH | 新開視窗直接連上，`hostname` 為 `youbike-vm`（自動走 IAP） | 11:04 |

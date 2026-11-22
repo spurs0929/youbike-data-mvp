@@ -338,7 +338,8 @@ CLI 介面（使用者 11/22 確認）：
 部署方式、安裝步驟與驗收紀錄見 [deploy/README.md](../deploy/README.md)，這裡只記重點。
 
 - **環境**：GCP e2-micro（1 GB RAM、2 GB swap）、標準永久磁碟 30 GB、Ubuntu 24.04 LTS Minimal、Python 3.12.3。
-  防火牆只開 SSH，VM 上沒有任何金鑰。
+  VM 上沒有任何金鑰。D0 時記為「防火牆只開 SSH」有誤：建立 VM 時已勾選允許 HTTP／HTTPS，
+  且預設網路開放 RDP；當時 80、443、3389 都沒有程式在聽。11/22 D1-c 已收斂（見下方 D1）。
 - **執行方式**：專用使用者 `youbike`；cron（UTC）每分鐘以 `flock -n` 執行 `collect.py`（單一寫入者），
   每 5 分鐘執行 `deploy/check_health.py`（最近成功擷取超過 10 分鐘、磁碟使用率超過門檻時輸出 `WARN`）。
 - **日誌**：logrotate 每日、保留 14 天、單檔 20 MB；journald 上限 200 MB、14 天。原始 gzip 與 JSONL 12/11 前不刪。
@@ -353,14 +354,35 @@ CLI 介面（使用者 11/22 確認）：
 
 ---
 
+## D1：完整部署（2026-11-22 完成）
+
+部署步驟、設計與完整驗收紀錄見 [deploy/README.md](../deploy/README.md) 的 D1-a、D1-b、D1-c 各節。
+
+- **D1-a：PostgreSQL 與 4C 排程**（`80d209c`）
+  - PostgreSQL 16.15，`listen_addresses = ''`（只用 Unix socket、不開 TCP），peer 驗證，VM 上沒有資料庫密碼。
+  - cron 每 5 分鐘的第 1 分鐘執行 4C（`flock -n -E 75`，被擋下時寫一行 `skipped`）。
+  - 驗收：連續 12 槽 `success`；每槽快照數等於來源批次 `station_count`（1,826）；4C 單次最大記憶體約 96.6 MB、
+    e2-micro 耗時約 5.8 秒；OOM 0。版本：Python 3.12.3、pandas 3.1.1、psycopg 3.3.9。
+- **D1-b：固定 IP、網域、Caddy HTTPS**（`8ccd404`）
+  - 固定 IP 35.230.112.185、`youbike-data-mvp.duckdns.org`（DuckDNS 手動設定 IP，VM 上沒有 Token）。
+  - Caddy 2.11.9：只有 `/healthz` 回 200，其他路徑 404、內容為空、無 `Server` 標頭；Let's Encrypt 憑證自動續期。
+  - Ubuntu 與 Caddy 皆納入 `unattended-upgrades`；Caddy 日誌只寫 journald。
+  - 部署後 4C 連續 30 槽正常；available 636 MB、Caddy 約 40 MB、OOM 0。swap 2.5 小時增加 14 MB，持續觀察。
+- **D1-c：SSH 只經 IAP**
+  - 新增 `allow-ssh-from-iap`（35.235.240.0/20 → 22），停用 `default-allow-ssh`、`default-allow-rdp`。
+  - 不經 IAP 直接連 22、3389 皆被擋下；瀏覽器 SSH 自動走 IAP，可正常登入。
+
+**已知事項**：VM 的 pandas 為 3.1.1，本機 Python 3.10 無法安裝 pandas 3；依賴版本的可重現性在 12/6 封板前處理。
+
+---
+
 ## 下一步
 
 12/11 必要功能：資料擷取、資料庫、API、LINE Bot、LLM Function Calling。
 
-1. **D1**：VM 上部署 PostgreSQL 與 4C 排程、Caddy HTTPS、記憶體檢查、VM 與本機套件版本對齊。
-2. **API**（FastAPI）：`StationRepository` 介面、DTO、PostgreSQL 實作。
-3. **LINE Bot**：簽章驗證、`webhookEventId` 冪等、定位查詢、固定指令；限流與額度。
-4. **LLM Function Calling**：最小範圍 1～2 個工具。
+1. **API**（FastAPI）：`StationRepository` 介面、DTO、PostgreSQL 實作；只綁 `127.0.0.1`，由 Caddy 對外。
+2. **LINE Bot**：簽章驗證、`webhookEventId` 冪等、定位查詢、固定指令；限流與額度。
+3. **LLM Function Calling**：最小範圍 1～2 個工具。
 
 已決定、不再列為待辦：擷取排程執行環境與原始檔儲存位置（A1、A2：GCP e2-micro、VM 持久磁碟）、
-4C-2、4C-3（2026-11-22 完成）。
+4C-2、4C-3、D1（2026-11-22 完成）。
