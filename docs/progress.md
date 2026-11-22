@@ -4,9 +4,10 @@
 整體架構與後續規劃以「YouBike 2.0 專案設計定版 v1.3」為準，本文件只記錄已實作的部分。
 
 - 最後更新：2026-11-22
-- 測試數量：396 項（transform 28、collect 39、schema 61、check_health 13、snapshot 100、
-  snapshot_job 129、snapshot_job_db 26）。
-  未設定測試資料庫時為 309 passed、87 skipped（schema 與 snapshot_job_db 共 87 項需要資料庫）。
+- 測試數量：576 項（transform 28、collect 39、schema 61、check_health 13、snapshot 100、
+  snapshot_job 129、snapshot_job_db 26、repository 67、repository_db 34、api 69、api_db 10）。
+  未設定測試資料庫時為 445 passed、131 skipped（schema、snapshot_job_db、repository_db、api_db 共 131 項需要資料庫）。
+  Windows 本機另有 1 項符號連結測試 skip。
 
 ---
 
@@ -30,14 +31,20 @@ snapshot_job.py  每 5 分鐘一個時間槽：挑批次、讀原始檔        �
       │          └─ snapshot.py 逐站驗證（內部呼叫 clean()）  （4C-2）
       ▼
 PostgreSQL  fetch_batches、stations、station_snapshots         （4A、4C-3）
+      │
+      ▼
+repository.py  StationRepository：最新快照查詢（psycopg_pool 連線池）  （API-1、API-2b）
+      │
+      ▼
+api.py / app_main.py  FastAPI 三個查詢端點＋/health、/ready      （API-2a、API-2b）
 ```
 
 `collect.py` 只負責把原始資料保存下來，不碰資料庫。
 `snapshot_job.py` 讀取 `collect.py` 的輸出，經 `snapshot.py` 驗證後寫入 PostgreSQL。
 兩者只透過資料目錄銜接，擷取不受資料庫狀態影響。
 
-部署：GCP e2-micro 上以 cron 每分鐘執行 `collect.py`（D0，見下方）。
-`snapshot_job.py` 的排程屬於 D1，尚未部署。
+部署：GCP e2-micro 上以 cron 每分鐘執行 `collect.py`（D0），每 5 分鐘執行 `snapshot_job.py`（D1），見下方。
+API 尚未部署（API-3）。
 
 ---
 
@@ -376,13 +383,70 @@ CLI 介面（使用者 11/22 確認）：
 
 ---
 
+## API：站點查詢（`src/repository.py`、`src/api.py`、`src/app_main.py`）
+
+### API-1：Repository（`5fe3fa8`、`4683101`）
+
+- `StationRepository`（`typing.Protocol`）：`get_station`、`search_by_name`、`find_nearby`；API 與日後的 LLM 工具共用。
+- `StationStatus`（frozen dataclass）：欄位照設計定版 8.4，另加 `distance_m`（只有附近查詢會填）。
+- **「最新」**：每站以主鍵 `(station_id, slot_time)` 倒序取一筆，再以該批次 `fetched_at` 判斷
+  `now − fetched_at ≤ 30 分鐘`；不在視窗內不回傳，**不以舊快照補位**；最新一筆無效時照樣回傳並附 `invalid_reason`。
+- 站名搜尋 `ILIKE`（`\`、`%`、`_` 跳脫）；附近查詢以方框預篩（處理跨 ±180°、極點）再以 haversine 精算。
+- 參數錯誤在查詢前丟 `InvalidQueryError`，不截斷；查無資料時單站 `None`、列表 `[]`。使用者輸入一律參數綁定。
+- **時區修正**（`4683101`）：psycopg 依連線的 `TimeZone` 回傳 `timestamptz`，本機（Asia/Taipei）與雲端（UTC）不同；
+  DTO 時間一律轉 UTC，測試涵蓋 `SET TIME ZONE 'Asia/Taipei'`。
+- 效能（雲端，7 天份假資料 368 萬列）：單站 3 ms、全站名符合的搜尋 34 ms、3 公里附近 13 ms；
+  查詢計畫為 `Index Scan Backward using station_snapshots_pkey`，不需新增索引。VM 實測留到 API-3。
+
+### API-2a：FastAPI 端點與 Mock（`458070e`）
+
+- `GET /stations/nearby`、`GET /stations?q=`、`GET /stations/{station_id}`；列表回 `{"count", "items"}`，單站查無 404。
+- 參數錯誤 422：型別錯誤由 FastAPI 檢查（`detail` 為陣列），範圍與長度為 `InvalidQueryError`（`detail` 為一句中文）。
+  兩種格式刻意維持。
+- `create_app(repository)`：正式環境傳 PostgreSQL 實作，測試傳 `InMemoryStationRepository`（Mock），不需資料庫。
+- 端點為同步函式（psycopg 同步連線），由 FastAPI 放到執行緒池執行。
+
+### Code Review 修正（`bb46363`）
+
+- 站名排序改為 `COLLATE "C"`（Unicode 碼位），與 Python、Mock 一致，不受資料庫定序影響；
+  修正前在 ICU zh-TW 資料庫上排序不同。Mock 的站名比對註明為近似實作（`casefold` vs `ILIKE`）。
+- 不採納：排除未來時間的 `fetched_at`（寫入與讀取在同一台 VM、同一時鐘；時鐘往回調時加上限會讓全部站消失）。
+
+### API-2b：連線池、`/health`、`/ready`
+
+- **連線池**（`psycopg_pool`）：`min_size=1`、`max_size=4`、借不到連線 5 秒逾時；借出前檢查連線（`check_connection`）。
+  - 理由：VM `max_connections = 20`，扣除保留連線、4C 與手動 psql 後約剩 15；FastAPI 執行緒池預設 40，
+    若每個請求開新連線，尖峰時可能耗盡連線並擋住 4C。連線池讓一個 app instance 最多 4 條，其餘請求排隊。
+- `PooledStationRepository`：每次查詢以 `pool.connection()` 借還（含例外路徑），查詢內容沿用 `PostgresStationRepository`。
+  參數先驗證，不合法時不借連線（資料庫離線時參數錯誤仍是 422）。
+- **錯誤分類**：只有「連不到資料庫」轉為 `RepositoryUnavailableError` → HTTP 503：借不到連線、連線池已關閉、
+  查詢途中連線中斷（`conn.broken`）。SQL 錯誤、連線仍正常的 `OperationalError`（例如查詢逾時）、程式錯誤照原樣丟出（500）。
+  503 回應只有固定訊息，不含連線字串或錯誤細節；細節只寫伺服器端日誌。
+- `/health`：不碰資料庫，固定 200。`/ready`：用同一個連線池執行 `SELECT 1`，失敗 503 `{"status": "unavailable"}`。
+- `src/app_main.py`：`create_production_app()` 讀 `YOUBIKE_DATABASE_URL`（未設定或空白時直接失敗），
+  在 FastAPI lifespan 以 `open(wait=False)` 開啟連線池、結束時關閉。資料庫離線時 app 照樣啟動，
+  `/health` 200、`/ready` 503；資料庫恢復後連線池在背景重連，`/ready` 轉回 200。
+  `api.py` 不匯入 psycopg，仍可只用 Mock 測試。
+- 啟動方式（API-3 才加入 uvicorn）：`uvicorn app_main:create_production_app --factory`。
+- 測試：單元 30 項（假連線池：錯誤分類、借還、open/close 呼叫）；整合 10 項（真 PostgreSQL，連線時區 Asia/Taipei）：
+  - 連線數不超過 4（佔滿 4 條時第 5 個請求 503，歸還後 200）、併發請求後全部 `idle`；
+  - 例外路徑（程式錯誤、SQL 錯誤、查詢逾時）後沒有 idle in transaction，且錯誤類型不變；
+  - 連線被中斷（`pg_terminate_backend`）→ 503 類錯誤，之後自動換新連線；
+  - lifespan 結束後連線池關閉、`pg_stat_activity` 中該 app 的連線歸零；
+  - 以 TCP 轉送器模擬資料庫斷線：離線啟動 503 → 恢復 200 → 執行中斷線 503 → 再恢復 200。
+- **已知限制**：連線池關閉後不能重新開啟，一個 app 物件只能經歷一次 lifespan（uvicorn 正常使用不受影響）。
+  資料過期提示不在 API-2b 範圍（LINE Bot 顯示時再決定）。
+
+---
+
 ## 下一步
 
 12/11 必要功能：資料擷取、資料庫、API、LINE Bot、LLM Function Calling。
 
-1. **API**（FastAPI）：`StationRepository` 介面、DTO、PostgreSQL 實作；只綁 `127.0.0.1`，由 Caddy 對外。
+1. **API-3（部署）**：systemd 服務、uvicorn 只綁 `127.0.0.1`、Caddy `reverse_proxy`；API 專用的唯讀資料庫角色；
+   VM 上的記憶體與查詢計畫驗收。
 2. **LINE Bot**：簽章驗證、`webhookEventId` 冪等、定位查詢、固定指令；限流與額度。
 3. **LLM Function Calling**：最小範圍 1～2 個工具。
 
 已決定、不再列為待辦：擷取排程執行環境與原始檔儲存位置（A1、A2：GCP e2-micro、VM 持久磁碟）、
-4C-2、4C-3、D1（2026-11-22 完成）。
+4C-2、4C-3、D1（2026-11-22 完成）、API-1、API-2a、API-2b（2026-11-22 完成）。

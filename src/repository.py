@@ -5,6 +5,8 @@
   實作遵守相同方法與回傳型別，API 階段只替換實作，不改介面。
 - `PostgresStationRepository`：直接查詢 PostgreSQL 最新快照。
 - `InMemoryStationRepository`：Mock 實作，供 API 與 LLM 工具測試使用，不需要資料庫。
+- `PooledStationRepository`：正式環境使用；每次查詢向 psycopg_pool 連線池借一條連線，
+  交給 `PostgresStationRepository` 查詢後歸還（API-2b）。
 
 「最新」的定義：
   每站先以主鍵 (station_id, slot_time) 倒序取出最新的一筆快照，再以該快照所屬
@@ -14,7 +16,8 @@
   （例如 stale）時照樣回傳並附 invalid_reason，同樣不改用較舊的有效快照。
 
 參數錯誤一律在查詢資料庫之前丟出 InvalidQueryError（ValueError 子類別），
-由 API 層轉為 HTTP 422；超過上限的參數不會被自動截斷。查無資料時，
+由 API 層轉為 HTTP 422；超過上限的參數不會被自動截斷。資料庫連線失敗（借不到連線、
+連線中斷）轉為 RepositoryUnavailableError，由 API 層轉為 HTTP 503。查無資料時，
 單站查詢回傳 None，列表查詢回傳空 list。所有使用者輸入都以參數綁定傳給 SQL。
 """
 
@@ -44,6 +47,17 @@ _BOX_MARGIN_DEG = 1e-9
 
 class InvalidQueryError(ValueError):
     """查詢參數不合法（型別、範圍、長度）。API 層轉為 HTTP 422。"""
+
+
+class RepositoryUnavailableError(RuntimeError):
+    """資料庫暫時無法使用：借不到連線、連線池已關閉、連線中斷。API 層轉為 HTTP 503。
+
+    只用於「連不到資料庫」；SQL 錯誤、程式邏輯錯誤照原樣往外丟，不包成這個例外。
+    訊息固定，不含連線字串或底層錯誤細節（原始例外保留在 __cause__，只供伺服器端記錄）。
+    """
+
+
+UNAVAILABLE_MESSAGE = "資料庫暫時無法使用"
 
 
 # ---------------------------------------------------------------- DTO
@@ -332,6 +346,82 @@ class PostgresStationRepository:
                 results.append(replace(status, distance_m=distance))
         results.sort(key=lambda s: (s.distance_m, s.station_id))
         return results[:limit]
+
+
+class PooledStationRepository:
+    """以 psycopg_pool 連線池查詢；查詢內容與 PostgresStationRepository 相同（API-2b）。
+
+    - 每次查詢以 `pool.connection()` 借一條連線，結束時（包含例外）歸還連線池；
+      查詢本身由 PostgresStationRepository 執行，包在一個 transaction 內並結束。
+    - 參數先驗證，不合法時直接丟 InvalidQueryError，不借連線。
+    - 轉成 RepositoryUnavailableError 的只有：
+      1. 借不到連線（PoolTimeout）、連線池已關閉（PoolClosed）、等待者過多（TooManyRequests）；
+      2. 查詢途中的 OperationalError，且連線已中斷（`conn.broken` 或 `conn.closed`）。
+      其他錯誤（SQL 錯誤、連線仍正常的 OperationalError 例如查詢逾時、程式錯誤）照原樣丟出。
+    - 連線池的建立、開啟、關閉由呼叫端負責（見 app_main.py）。
+
+    psycopg 與 psycopg_pool 在方法內才匯入，只用 Mock 時本模組不需要這兩個套件。
+    """
+
+    def __init__(self, pool, *, clock: Callable[[], datetime] = _utc_now):
+        self._pool = pool
+        self._clock = clock
+
+    def _run(self, action: Callable):
+        import psycopg
+        from psycopg_pool import PoolClosed, PoolTimeout, TooManyRequests
+
+        try:
+            with self._pool.connection() as conn:
+                try:
+                    return action(conn)
+                except psycopg.OperationalError as exc:
+                    if conn.broken or conn.closed:
+                        raise RepositoryUnavailableError(UNAVAILABLE_MESSAGE) from exc
+                    raise
+        except (PoolTimeout, PoolClosed, TooManyRequests) as exc:
+            raise RepositoryUnavailableError(UNAVAILABLE_MESSAGE) from exc
+
+    def _repository(self, conn) -> PostgresStationRepository:
+        return PostgresStationRepository(conn, clock=self._clock)
+
+    def ping(self) -> None:
+        """就緒檢查：借一條連線執行 SELECT 1。失敗時丟 RepositoryUnavailableError。"""
+
+        def action(conn):
+            with conn.transaction():
+                conn.execute("SELECT 1").fetchone()
+
+        self._run(action)
+
+    def get_station(self, station_id: str) -> StationStatus | None:
+        validate_station_id(station_id)
+        return self._run(lambda conn: self._repository(conn).get_station(station_id))
+
+    def search_by_name(
+        self, keyword: str, limit: int = DEFAULT_LIMIT
+    ) -> list[StationStatus]:
+        validate_keyword(keyword)
+        validate_limit(limit)
+        return self._run(
+            lambda conn: self._repository(conn).search_by_name(keyword, limit)
+        )
+
+    def find_nearby(
+        self,
+        latitude: float,
+        longitude: float,
+        radius_m: float = DEFAULT_RADIUS_M,
+        limit: int = DEFAULT_LIMIT,
+    ) -> list[StationStatus]:
+        validate_coordinates(latitude, longitude)
+        validate_radius(radius_m)
+        validate_limit(limit)
+        return self._run(
+            lambda conn: self._repository(conn).find_nearby(
+                latitude, longitude, radius_m, limit
+            )
+        )
 
 
 # ---------------------------------------------------------------- Mock 實作
