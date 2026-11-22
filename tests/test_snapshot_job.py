@@ -800,10 +800,166 @@ def test_default_counts_are_not_shared_between_instances():
 # ================================================================ 不讀取目前時間
 
 
-def test_module_does_not_read_current_time():
+def _current_time_calls(tree):
+    """找出所有 x.now()、x.today()、x.utcnow()、time.time() 呼叫與所在的函式。"""
+    import ast
+
+    found = []
+
+    def visit(node, func):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func = node.name
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"now", "today", "utcnow", "time"}
+        ):
+            found.append((node.func.attr, func))
+        for child in ast.iter_child_nodes(node):
+            visit(child, func)
+
+    visit(tree, None)
+    return found
+
+
+def test_only_cli_entry_reads_current_time():
+    import ast
+
     source = (Path(__file__).parent.parent / "src" / "snapshot_job.py").read_text(
         encoding="utf-8"
     )
-    assert "now(" not in source
-    assert "time.time" not in source
-    assert "today(" not in source
+    calls = _current_time_calls(ast.parse(source))
+
+    assert calls == [("now", "main")]
+
+
+# ================================================================ CLI（不連資料庫）
+
+NOW = datetime(2026, 11, 21, 8, 12, 30, tzinfo=UTC)
+
+
+class FakeConn:
+    autocommit = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def run_main(monkeypatch, capsys, argv, report=None, error=None):
+    seen = {}
+
+    def fake_run_slot(conn, data_dir, slot):
+        seen["slot"] = slot
+        seen["data_dir"] = data_dir
+        if error:
+            raise error
+        return report
+
+    monkeypatch.setattr(job, "run_slot", fake_run_slot)
+    code = job.main(argv, now=NOW, connect=FakeConn, data_dir="somewhere")
+    out = capsys.readouterr()
+    return code, out, seen
+
+
+def test_cli_default_processes_latest_closed_slot(monkeypatch, capsys):
+    report = build_report(at(5), counts())  # no_batch
+    code, out, seen = run_main(monkeypatch, capsys, [], report)
+
+    assert seen["slot"] == at(5)
+    assert seen["data_dir"] == Path("somewhere")
+    assert code == 0
+    assert json.loads(out.out) == report
+    assert out.out.count("\n") == 1
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_code"),
+    [
+        ({"written_valid": 1}, 0),  # success
+        ({"written_valid": 1, "skipped": 1}, 0),  # partial
+        ({"skipped": 1}, 1),  # failed（沒有保留任何快照）
+    ],
+)
+def test_cli_exit_codes(monkeypatch, capsys, tmp_path, kwargs, expected_code):
+    report = build_report(
+        at(5), counts(**kwargs), batch=chosen_batch(tmp_path), source=job.SOURCE_JSONL
+    )
+    code, _, _ = run_main(monkeypatch, capsys, [], report)
+    assert code == expected_code
+
+
+def test_cli_unexpected_error_prints_failed_report(monkeypatch, capsys):
+    code, out, _ = run_main(monkeypatch, capsys, [], error=RuntimeError("boom"))
+
+    report = json.loads(out.out)
+    assert code == 1
+    assert report["result"] == "failed"
+    assert report["error"] == "RuntimeError: boom"
+    assert report["slot"] == "2026-11-21T08:05:00+00:00"
+    assert "Traceback" in out.err
+
+
+def test_cli_missing_database_url(monkeypatch, capsys):
+    monkeypatch.delenv(job.DATABASE_URL_ENV, raising=False)
+    code = job.main([], now=NOW, data_dir="somewhere")
+
+    report = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert "YOUBIKE_DATABASE_URL is not set" in report["error"]
+
+
+@pytest.mark.parametrize(
+    ("slot", "expected"),
+    [
+        ("2026-11-21T08:05:00Z", at(5)),  # 最近一個已結束的槽
+        ("2026-11-21T16:00:00+08:00", at(0)),
+        # 7 天邊界：NOW − 7 天 = 11/14 08:12:30，08:15 的槽起點晚於邊界
+        ("2026-11-14T08:15:00Z", datetime(2026, 11, 14, 8, 15, tzinfo=UTC)),
+    ],
+)
+def test_cli_backfill_slot_accepted(monkeypatch, capsys, slot, expected):
+    report = build_report(expected, counts())
+    code, _, seen = run_main(monkeypatch, capsys, ["--slot", slot], report)
+    assert code == 0
+    assert seen["slot"] == expected
+
+
+@pytest.mark.parametrize(
+    "slot",
+    [
+        "2026-11-21T08:10:00Z",  # 目前所在的槽，尚未結束
+        "2026-11-21T09:00:00Z",  # 未來
+        "2026-11-14T08:10:00Z",  # 槽起點早於 NOW − 7 天
+        "2026-11-21T08:07:00Z",  # 未對齊
+        "2026-11-21T08:05:00",  # 沒有時區
+    ],
+)
+def test_cli_backfill_slot_rejected_with_exit_code_2(monkeypatch, capsys, slot):
+    with pytest.raises(SystemExit) as exc:
+        run_main(monkeypatch, capsys, ["--slot", slot])
+    assert exc.value.code == 2
+
+
+def test_check_backfill_slot_boundaries():
+    now = datetime(2026, 11, 21, 8, 10, tzinfo=UTC)
+    # 剛好 7 天前的槽起點仍可補跑；再早一個槽就不行
+    assert job.check_backfill_slot(now - timedelta(days=7), now)
+    with pytest.raises(ValueError):
+        job.check_backfill_slot(now - timedelta(days=7, minutes=5), now)
+    # now 剛好 08:10 時，08:05 已結束、08:10 尚未結束
+    assert job.check_backfill_slot(at(5), now) == at(5)
+    with pytest.raises(ValueError):
+        job.check_backfill_slot(at(10), now)
+
+
+def test_slot_lock_key():
+    assert job.slot_lock_key(datetime(1970, 1, 1, 0, 5, tzinfo=UTC)) == 1
+    assert job.slot_lock_key(at(10)) == job.slot_lock_key(at(5)) + 1
+    assert job.slot_lock_key(SLOT.astimezone(TAIPEI)) == job.slot_lock_key(SLOT)
+    # 2038 年之後仍在 PostgreSQL integer 範圍內（4 bytes）
+    assert job.slot_lock_key(datetime(2100, 1, 1, tzinfo=UTC)) < 2**31
+    with pytest.raises(ValueError):
+        job.slot_lock_key(at(6))

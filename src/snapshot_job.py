@@ -1,30 +1,49 @@
 """Batch 4C-3：五分鐘快照寫入作業。
 
-4C-3a（本次）只包含不需要資料庫的部分，全部是純函式或只讀檔案：
+用法（CLI）::
 
-- 時間槽：批次歸槽、最近一個已結束的槽、`--slot` 參數解析。
-- 批次紀錄：讀取 fetch_batches.jsonl、去重、挑選槽內批次。
-- 原始檔：在資料目錄內讀取 gzip 並解析站點。
-- 處理結果：依計數分類 result，組成一行 JSON。
+    YOUBIKE_DATABASE_URL=postgresql://user@host:5432/db \
+    YOUBIKE_DATA_DIR=/home/youbike/data \
+    python src/snapshot_job.py [--slot 2026-11-21T08:05:00Z]
 
-資料庫寫入（同槽鎖、transaction／savepoint、各表寫入）與 CLI 入口屬於 4C-3b。
-規格見定版 4.4.1、4.4.6 與 docs/schema.md 第六節。
+- 不指定 --slot：處理最近一個已結束的槽（排程用）。
+- --slot：手動補跑指定的槽；必須已結束，且槽起點不早於目前時間 7 天前（定版 4.2）。
+- 密碼不放進連線字串，以 PGPASSWORD 或 pgpass 檔提供。
+- 每次執行輸出一行 JSON 到 stdout。結束碼：success／partial／no_batch 為 0，
+  failed 為 1，參數錯誤為 2（argparse）。
 
-本模組不讀取目前時間：需要「現在」的函式一律由呼叫端傳入，
-相同輸入一定得到相同結果，方便重現問題與測試邊界。
+組成：
+
+- 4C-3a（純函式，不連資料庫）：時間槽、讀取 fetch_batches.jsonl 與挑選批次、
+  在資料目錄內讀取 gzip、依計數分類結果並組成一行 JSON。
+- 4C-3b：run_slot() 在單一 transaction 內取得同槽鎖、決定來源批次、
+  逐站以 savepoint 寫入 stations 與 station_snapshots；以及 CLI 入口 main()。
+
+規格見定版 4.4.1、4.4.5、4.4.6 與 docs/schema.md 第三、六節。
+
+除了 CLI 入口 main() 之外，本模組不讀取目前時間：需要「現在」的函式
+一律由呼叫端傳入，相同輸入一定得到相同結果，方便重現問題與測試邊界。
 """
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import json
+import os
+import sys
+import traceback
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import psycopg
+from psycopg.pq import TransactionStatus
+
+from collect import BATCH_LOG, DATA_DIR
 from fetch import FetchError, parse_stations
-from snapshot import REASON_ORDER, BatchValidation
+from snapshot import REASON_ORDER, BatchValidation, StationResult, validate_batch
 
 SLOT_LENGTH = timedelta(minutes=5)
 
@@ -467,3 +486,358 @@ def build_report(
 def format_report(report: dict) -> str:
     """處理結果轉成一行 JSON（cron 導向日誌檔）。"""
     return json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------- 資料庫寫入（4C-3b）
+
+DATABASE_URL_ENV = "YOUBIKE_DATABASE_URL"
+
+# pg_advisory_xact_lock(LOCK_NAMESPACE, slot_lock_key(slot))。
+# 第一個鍵固定，與日後其他用途的 advisory lock 區分；第二個鍵每個槽不同。
+LOCK_NAMESPACE = 4031
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+class SlotConflictError(Exception):
+    """同一個槽已有多個不同的 fetch_batch_id，或沿用的原批次資料不完整。"""
+
+
+def slot_lock_key(slot: datetime) -> int:
+    """同槽鎖的第二個鍵：slot 的 UNIX 秒數 // 300（每個槽一個整數）。"""
+    slot = _to_utc(slot, "slot")
+    if not is_slot_start(slot):
+        raise ValueError(f"slot is not aligned to 5 minutes: {slot.isoformat()}")
+    return (slot - _EPOCH) // SLOT_LENGTH
+
+
+def acquire_slot_lock(conn, slot: datetime) -> None:
+    """在目前的 transaction 內取得同槽鎖；transaction 結束時自動釋放。
+
+    其他連線處理同一個槽時會在這裡等待，不同槽互不影響。
+    """
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(%s, %s)", (LOCK_NAMESPACE, slot_lock_key(slot))
+    )
+
+
+def _slot_batch_ids(conn, slot: datetime) -> list[int]:
+    rows = conn.execute(
+        "SELECT DISTINCT fetch_batch_id FROM station_snapshots"
+        " WHERE slot_time = %s ORDER BY 1",
+        (slot,),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def _batch_by_pk(conn, pk: int) -> BatchRecord:
+    row = conn.execute(
+        "SELECT batch_id, fetched_at, source_updated_at, status, station_count,"
+        " raw_path, error FROM fetch_batches WHERE id = %s",
+        (pk,),
+    ).fetchone()
+    if row is None:  # 外鍵保證存在；保險起見仍檢查
+        raise SlotConflictError(f"fetch_batches id {pk} not found")
+    batch_id, fetched_at, source_updated_at, status, count, raw_path, error = row
+    if status != STATUS_SUCCESS or raw_path is None:
+        raise SlotConflictError(f"existing batch {batch_id} is not a usable success")
+    return BatchRecord(
+        batch_id=batch_id,
+        fetched_at=fetched_at.astimezone(timezone.utc),
+        source_updated_at=(
+            None
+            if source_updated_at is None
+            else source_updated_at.astimezone(timezone.utc)
+        ),
+        status=status,
+        station_count=count,
+        raw_path=raw_path,
+        error=error,
+    )
+
+
+def _ensure_batch_row(conn, batch: BatchRecord) -> int:
+    """確保 fetch_batches 有這一批並回傳 id（docs/schema.md 第六節步驟 5）。"""
+    row = conn.execute(
+        """
+        INSERT INTO fetch_batches
+          (batch_id, fetched_at, source_updated_at, status,
+           station_count, raw_path, error)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (batch_id) DO NOTHING
+        RETURNING id
+        """,
+        (
+            batch.batch_id,
+            batch.fetched_at,
+            batch.source_updated_at,
+            batch.status,
+            batch.station_count,
+            batch.raw_path,
+            batch.error,
+        ),
+    ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT id FROM fetch_batches WHERE batch_id = %s", (batch.batch_id,)
+        ).fetchone()
+    return row[0]
+
+
+def _existing_station_ids(conn, slot: datetime) -> set[str]:
+    rows = conn.execute(
+        "SELECT station_id FROM station_snapshots WHERE slot_time = %s", (slot,)
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+# 「只用不早於該站最近快照槽的非 NULL 值覆寫」由單一 INSERT ... ON CONFLICT
+# DO UPDATE 完成：比較與更新在同一個敘述內、對該列加鎖後進行，
+# 不同槽同時更新同一站時，後到者會等前者 commit，再以最新的 last_seen_at 判斷。
+# SET 中的 stations.* 都是更新前的舊值。
+_UPSERT_STATION = """
+INSERT INTO stations
+  (station_id, station_name, district, address, latitude, longitude,
+   first_seen_at, last_seen_at)
+VALUES (%(station_id)s, %(station_name)s, %(district)s, %(address)s,
+        %(latitude)s, %(longitude)s, %(slot)s, %(slot)s)
+ON CONFLICT (station_id) DO UPDATE SET
+  station_name = CASE WHEN EXCLUDED.last_seen_at >= stations.last_seen_at
+                      THEN COALESCE(EXCLUDED.station_name, stations.station_name)
+                      ELSE stations.station_name END,
+  district     = CASE WHEN EXCLUDED.last_seen_at >= stations.last_seen_at
+                      THEN COALESCE(EXCLUDED.district, stations.district)
+                      ELSE stations.district END,
+  address      = CASE WHEN EXCLUDED.last_seen_at >= stations.last_seen_at
+                      THEN COALESCE(EXCLUDED.address, stations.address)
+                      ELSE stations.address END,
+  latitude     = CASE WHEN EXCLUDED.last_seen_at >= stations.last_seen_at
+                      THEN COALESCE(EXCLUDED.latitude, stations.latitude)
+                      ELSE stations.latitude END,
+  longitude    = CASE WHEN EXCLUDED.last_seen_at >= stations.last_seen_at
+                      THEN COALESCE(EXCLUDED.longitude, stations.longitude)
+                      ELSE stations.longitude END,
+  first_seen_at = LEAST(stations.first_seen_at, EXCLUDED.first_seen_at),
+  last_seen_at  = GREATEST(stations.last_seen_at, EXCLUDED.last_seen_at)
+"""
+
+_INSERT_SNAPSHOT = """
+INSERT INTO station_snapshots
+  (station_id, slot_time, fetch_batch_id, info_time, is_active,
+   total_spaces, available_bikes, available_spaces, is_valid, invalid_reason)
+VALUES (%(station_id)s, %(slot)s, %(fetch_batch_id)s, %(info_time)s, %(is_active)s,
+        %(total_spaces)s, %(available_bikes)s, %(available_spaces)s,
+        %(is_valid)s, %(invalid_reason)s)
+ON CONFLICT (station_id, slot_time) DO NOTHING
+RETURNING 1
+"""
+
+
+def _station_params(result: StationResult, slot: datetime) -> dict:
+    info = result.info
+    return {
+        "station_id": result.station_id,
+        "station_name": info.station_name if info else None,
+        "district": info.district if info else None,
+        "address": info.address if info else None,
+        "latitude": info.latitude if info else None,
+        "longitude": info.longitude if info else None,
+        "slot": slot,
+    }
+
+
+def _snapshot_params(result: StationResult, slot: datetime, batch_pk: int) -> dict:
+    return {
+        "station_id": result.station_id,
+        "slot": slot,
+        "fetch_batch_id": batch_pk,
+        "info_time": result.info_time,
+        "is_active": result.is_active,
+        "total_spaces": result.total_spaces,
+        "available_bikes": result.available_bikes,
+        "available_spaces": result.available_spaces,
+        "is_valid": result.is_valid,
+        "invalid_reason": result.invalid_reason,
+    }
+
+
+class _SnapshotExists(Exception):
+    """快照已存在：用來回滾該站的 savepoint，撤銷同一 savepoint 內的 stations 更新。"""
+
+
+def _write_station(conn, result: StationResult, slot: datetime, batch_pk: int) -> bool:
+    """在一個 savepoint 內寫入一站：先 upsert stations（外鍵需要），再寫快照。
+
+    快照已存在時拋出 _SnapshotExists，savepoint 回滾，stations 不留下任何更新。
+    資料庫錯誤（psycopg.Error）同樣回滾 savepoint 後往外拋，由呼叫端計為失敗。
+    """
+    with conn.transaction():
+        conn.execute(_UPSERT_STATION, _station_params(result, slot))
+        inserted = conn.execute(
+            _INSERT_SNAPSHOT, _snapshot_params(result, slot, batch_pk)
+        ).fetchone()
+        if inserted is None:
+            raise _SnapshotExists(result.station_id)
+    return True
+
+
+def run_slot(conn, data_dir: Path, slot: datetime) -> dict:
+    """處理一個槽並回傳處理結果（build_report 的格式）。
+
+    conn 必須是 autocommit 模式且不在 transaction 中：本函式自行 BEGIN／COMMIT，
+    同槽鎖跟著這個 transaction 開始與釋放。整個流程在同一個 transaction 內：
+
+    1. 取得同槽鎖（在查詢既有快照之前）。
+    2. 決定來源批次：已有快照的槽沿用唯一的 fetch_batch_id（多個 → failed）；
+       零快照的槽從 JSONL 挑（挑不到 → no_batch）。
+    3. 讀取 gzip 並逐站驗證（缺失或損壞 → failed，既有快照不動）。
+    4. 確保 fetch_batches 有這一批。
+    5. 已有快照的站計為已存在；其餘每站一個 savepoint 寫入。
+    6. COMMIT。
+
+    同槽衝突、原始檔錯誤與資料庫錯誤都會回滾整個 transaction 並回報 failed，
+    計數不會被報成已寫入。其他例外（例如程式錯誤）回滾後往外拋。
+    """
+    slot = _to_utc(slot, "slot")
+    if not is_slot_start(slot):
+        raise ValueError(f"slot is not aligned to 5 minutes: {slot.isoformat()}")
+    if not conn.autocommit:
+        raise ValueError("run_slot requires an autocommit connection")
+
+    state: dict = {"batch": None, "source": None, "validation": None, "log": None}
+    counts = RunCounts()
+    try:
+        with conn.transaction():
+            acquire_slot_lock(conn, slot)
+
+            batch_ids = _slot_batch_ids(conn, slot)
+            if len(batch_ids) > 1:
+                raise SlotConflictError(
+                    f"slot has multiple fetch_batch_id: {batch_ids}"
+                )
+            if batch_ids:
+                batch = _batch_by_pk(conn, batch_ids[0])
+                state.update(batch=batch, source=SOURCE_EXISTING)
+            else:
+                log = read_batch_log(Path(data_dir) / BATCH_LOG)
+                batch = select_batch(log, slot)
+                state.update(batch=batch, source=SOURCE_JSONL, log=log)
+                if batch is None:
+                    return build_report(slot, counts, log=log)
+
+            stations = load_raw_stations(data_dir, batch.raw_path)
+            validation = validate_batch(stations, batch.fetched_at)
+            state["validation"] = validation
+            counts = RunCounts(skipped=validation.skipped)
+
+            batch_pk = batch_ids[0] if batch_ids else _ensure_batch_row(conn, batch)
+            existing = _existing_station_ids(conn, slot)
+            for result in validation.results:
+                if result.station_id in existing:
+                    counts.existing += 1
+                    continue
+                try:
+                    _write_station(conn, result, slot, batch_pk)
+                except _SnapshotExists:
+                    counts.existing += 1
+                    continue
+                except psycopg.Error as exc:
+                    # savepoint 回滾後 transaction 應回到正常狀態；若整筆已經失效
+                    # （例如連線中斷），不是單站問題，中止整筆 transaction。
+                    if conn.info.transaction_status != TransactionStatus.INTRANS:
+                        raise
+                    counts.failed += 1
+                    print(
+                        f"station {result.station_id!r} failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
+                if result.is_valid:
+                    counts.written_valid += 1
+                else:
+                    reason = result.invalid_reason
+                    counts.written_invalid[reason] = (
+                        counts.written_invalid.get(reason, 0) + 1
+                    )
+    except (SlotConflictError, RawBatchError, psycopg.Error) as exc:
+        return build_report(
+            slot,
+            counts,
+            batch=state["batch"],
+            source=state["source"],
+            validation=state["validation"],
+            log=state["log"],
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    return build_report(
+        slot,
+        counts,
+        batch=state["batch"],
+        source=state["source"],
+        validation=state["validation"],
+        log=state["log"],
+    )
+
+
+# ---------------------------------------------------------------- CLI
+
+# 定版 4.2：4D／4E 完成前，手動補跑範圍以 7 天為限。
+BACKFILL_LIMIT = timedelta(days=7)
+
+
+def check_backfill_slot(slot: datetime, now: datetime) -> datetime:
+    """手動補跑的槽必須已結束，且槽起點不早於 now − 7 天（剛好 7 天仍可）。"""
+    slot = _to_utc(slot, "slot")
+    now = _to_utc(now, "now")
+    if slot > latest_closed_slot(now):
+        raise ValueError(f"--slot 尚未結束：{slot.isoformat()}")
+    if slot < now - BACKFILL_LIMIT:
+        raise ValueError(f"--slot 超過 7 天補跑範圍：{slot.isoformat()}")
+    return slot
+
+
+def _parse_args(argv, now: datetime) -> datetime:
+    parser = argparse.ArgumentParser(description="寫入一個五分鐘時間槽的站點快照")
+    parser.add_argument(
+        "--slot",
+        help="手動補跑的槽起點，需帶時區，例如 2026-11-21T08:05:00Z（限 7 天內）",
+    )
+    args = parser.parse_args(argv)
+    if args.slot is None:
+        return latest_closed_slot(now)
+    try:
+        return check_backfill_slot(parse_slot(args.slot), now)
+    except ValueError as exc:
+        parser.error(str(exc))  # 結束碼 2
+        raise  # parser.error 不會返回；保留給型別檢查
+
+
+def main(argv=None, *, now=None, connect=None, data_dir=None) -> int:
+    """CLI 入口。now、connect、data_dir 只供測試替換。"""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    slot = _parse_args(argv, now)
+    data_dir = DATA_DIR if data_dir is None else Path(data_dir)
+
+    try:
+        if connect is None:
+            url = os.environ.get(DATABASE_URL_ENV)
+            if not url:
+                raise RuntimeError(f"{DATABASE_URL_ENV} is not set")
+            conn = psycopg.connect(url, autocommit=True)
+        else:
+            conn = connect()
+        with conn:
+            report = run_slot(conn, data_dir, slot)
+    except Exception as exc:  # noqa: BLE001 — 任何錯誤都要留下一行 JSON 結果
+        traceback.print_exc()
+        report = build_report(slot, RunCounts(), error=f"{type(exc).__name__}: {exc}")
+
+    print(format_report(report))
+    return 1 if report["result"] == RESULT_FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
