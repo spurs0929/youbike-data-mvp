@@ -1,14 +1,15 @@
 # PostgreSQL Schema 規格（Batch 4A-1）
 
 - 依據：《YouBike 2.0 專案設計定版 v1.2》第四～六節（4C 寫入規則見定版 4.4）
-- 狀態：第二～五節的 SQL 已轉為正式 migration `migrations/001_init.sql`（4A-2），並由 `tests/test_schema.py` 驗證。第六節的 4C 寫入規則已確定，尚未實作。
-- 最後更新：2026-11-07
+- 狀態：第二～五節的 SQL 已轉為正式 migration `migrations/001_init.sql`（4A-2），並由 `tests/test_schema.py` 驗證。第六節的 4C 寫入規則已由 `src/snapshot.py`（4C-2）、`src/snapshot_job.py`（4C-3）實作，並由 `tests/test_snapshot*.py` 驗證。
+- 最後更新：2026-11-22
 
 本文件中的標記：
 
 - **【定版】**：設計定版已確定的設計。
 - **【4A-1 確認】**：4A-1 規格審閱時確認的約束（2026-11-02）。
 - **【4C 確認】**：4C 開工前確認的寫入規則（2026-11-07，定版 v1.2 4.4）。
+- **【4C-3 定案】**：4C 規格中標為「實作時確認」的細節，於 4C-3 實作時決定（2026-11-22）。
 - **【待定】**：定版附錄 A 的待議事項，或屬於後續 Batch 的實作細節。本文件只記錄，不做決定。
 
 ---
@@ -110,7 +111,9 @@ CREATE TABLE fetch_batches (
 ### 待定
 
 - **【待定：4B】** JSONL 中違反上述約束的行，是否在匯入時視為損壞行並略過。
+  4C 讀取 JSONL 挑選批次時已採「視為壞行略過、計入警告」（4C-3a）；4B 匯入是否沿用，4B 開工時決定。
 - **【待定：4B】** 同一個 `batch_id` 出現多次且內容不同時的處理（`docs/progress.md` 規格為保留第一筆並警告）。
+  4C 讀取時已採「保留第一筆、其餘計入重複 ID 數」（4C-3a）。
 
 ---
 
@@ -345,12 +348,12 @@ CREATE TABLE station_hourly_stats (
 
 ## 六、4C 最新快照寫入流程（規格）
 
-依定版 v1.2 4.2、4.4。具體程式留到 4C-2、4C-3，本節只規定行為。
+依定版 v1.2 4.2、4.4。本節規定行為；實作為 `src/snapshot.py`（逐站驗證，4C-2）與 `src/snapshot_job.py`（時間槽、批次、寫入，4C-3），實作時的判斷記錄在 [progress.md](progress.md) 的 Batch 4C。
 
 ### 時間槽與批次【4C 確認】
 
 - 時間槽為 UTC 五分鐘半開區間 `[T, T+5 分)`，以批次 `fetched_at` 歸槽。
-- 排程每 5 分鐘處理**最近一個已結束**的槽；`--slot` 參數供手動補跑指定槽。
+- 排程每 5 分鐘處理**最近一個已結束**的槽；`--slot` 參數供手動補跑指定槽，限已結束、且槽起點不早於「目前時間 − 7 天」（快照保存 7 天）【4C-3 定案】。
 - **零快照的槽**：從 `fetch_batches.jsonl` 選批次，取槽內 `status = success` 中 `fetched_at` 最新者；同時戳依 `batch_id` 排序取最後一個。不能只看檔案是否存在【定版】。
 - **已有快照的槽**：不從 JSONL 重新選批次。沿用該槽唯一的 `fetch_batch_id`，查 `fetch_batches.raw_path` 讀原始檔，只補缺少的站。
 - JSONL 於擷取完成後才寫入，槽結束時仍可能有槽內開始的擷取尚未落地。上述規則確保這類晚到批次不會讓同一槽混入兩份來源。
@@ -385,14 +388,23 @@ CREATE TABLE station_hourly_stats (
 
 ### 流程
 
-1. **取得同槽鎖**【4C 確認】：排程與手動補跑對同一槽互斥（例如以 `slot_time` 為鍵的 `pg_advisory_xact_lock`，實作時確認），取得後才查詢既有快照。
+整個流程在**同一個 transaction** 內執行，同槽鎖跟著 transaction 開始與釋放【4C-3 定案】。
+
+1. **開始 transaction 並取得同槽鎖**【4C-3 定案】：
+   ```sql
+   SELECT pg_advisory_xact_lock(4031, <slot 的 UNIX 秒數> / 300);
+   ```
+   - 第一個鍵 `4031` 固定，代表「4C 同槽鎖」；第二個鍵每個槽一個整數，由程式計算 `slot_epoch // 300`（`slot_lock_key()`）。
+   - **advisory lock 的鍵在整個資料庫內有效，`4031` 日後不可用於其他用途。**
+   - 排程與手動補跑處理同一槽時，後到者在這裡等待；不同槽互不影響。
+   - 取得鎖之後才查詢既有快照，避免兩個行程都以為該槽是零快照而選了不同批次。
 2. **決定來源批次**：依「時間槽與批次」。
    - 槽內無成功批次 → 不寫入，結果 `no_batch`。
    - 該槽已有多個不同的 `fetch_batch_id` → 不寫入，結果 `failed`，回報衝突。
    - 選中批次的 gzip 缺失或損壞 → 結果 `failed`；已有快照的槽保留既有快照。
-3. **逐站驗證**：依「逐站驗證」，產生 `is_valid` 與 `invalid_reason`。
-4. **開始 transaction**。
-5. **確保批次列存在**【定版】：
+3. **逐站驗證**：依「逐站驗證」，產生 `is_valid` 與 `invalid_reason`。驗證期間仍持有同槽鎖。
+4. ~~開始 transaction~~：已併入步驟 1【4C-3 定案】。`pg_advisory_xact_lock` 必須在 transaction 內取得，所以 transaction 從步驟 1 就開始。保留這個編號，讓其他文件與程式註解引用的步驟 5、6 不變。
+5. **確保批次列存在**【定版】（來源為 JSONL 時；沿用既有批次時已有 `id`）：
    ```sql
    INSERT INTO fetch_batches (batch_id, fetched_at, ...)
    VALUES (...)
@@ -402,12 +414,16 @@ CREATE TABLE station_hourly_stats (
    `DO NOTHING` 遇到既有列時不回傳任何列，此時再以 `SELECT id FROM fetch_batches WHERE batch_id = ...` 取得 `id`。寫入的值取自 JSONL 中該批次的紀錄。
    **這一步失敗時整個 transaction 回滾**，不寫入任何快照。
 6. **逐站寫入，每站隔離**【4A-1 確認】：
-   - 每站開始前建立 `SAVEPOINT`（或等效機制）。
-   - 寫入 `station_snapshots`，採 `ON CONFLICT (station_id, slot_time) DO NOTHING`【4C 確認】。實際寫入時才 upsert `stations`（第三節）；因已存在而略過時計為「已存在」，不更新 `stations`。
-   - 成功則 `RELEASE SAVEPOINT`；失敗則 `ROLLBACK TO SAVEPOINT`，只撤銷該站，其餘站點繼續。
+   - 先以一次查詢取出該槽已有快照的站，計為「已存在」，不寫入、不更新 `stations`【4C-3 定案】。
+   - 其餘每站建立一個 `SAVEPOINT`，在其中依序：
+     1. upsert `stations`（第三節；快照的外鍵需要站點列先存在）。
+     2. 寫入 `station_snapshots`，採 `ON CONFLICT (station_id, slot_time) DO NOTHING`【4C 確認】。
+   - 快照因已存在而沒有寫入時，`ROLLBACK TO SAVEPOINT`，同一個 savepoint 內的 `stations` 更新一併撤銷，計為「已存在」【4C-3 定案】。
+   - 成功則 `RELEASE SAVEPOINT`；資料庫錯誤則 `ROLLBACK TO SAVEPOINT`，只撤銷該站並計為「失敗」，其餘站點繼續。
+   - 回滾 savepoint 後 transaction 若已失效（例如連線中斷），不是單站問題，中止整筆 transaction【4C-3 定案】。
    - 原因：PostgreSQL 的 transaction 一旦發生錯誤即進入失敗狀態，後續指令都會被拒絕。沒有 savepoint 時，一站失敗就會連帶整批失敗。
    - 驗證在步驟 3 完成，savepoint 是資料庫層的最後防線，正常情況下很少觸發。
-7. **commit**，並輸出處理結果。
+7. **commit**，並輸出處理結果。同槽衝突、原始檔錯誤、資料庫錯誤時回滾整個 transaction，結果為 `failed`，計數不報成已寫入。
 
 驗證規則改變時，舊快照不會因重跑而更新；需先刪除該範圍再重跑。
 
@@ -441,7 +457,7 @@ CREATE TABLE station_hourly_stats (
 ### 待定
 
 - **【待定：API 階段】** 查詢端如何提示資料過期。`max(info_time)` 可能被單一較新的站掩蓋其他過期站。
-- **【待定：部署】** 新鮮度門檻依平日尖峰實測複核；日誌輪替。
+- **【待定：部署】** 新鮮度門檻依平日尖峰實測複核（D0 累積約一週後）；4C 排程的日誌與輪替（D1）。
 
 ---
 
