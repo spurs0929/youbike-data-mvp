@@ -4,7 +4,25 @@
 >
 > **防火牆紀錄更正（2026-11-22）**：D0 時記為「防火牆只開 SSH」有誤。建立 VM 時勾選了「允許 HTTP／HTTPS 流量」，
 > 加上 GCP 預設網路本來就有的規則，實際對外開放的是 SSH（22）、HTTP（80）、HTTPS（443）、RDP（3389）、ICMP。
-> D0 期間 80、443、3389 都沒有程式在聽，沒有資料外露。目前狀態見〈D1-c〉的「防火牆現況」。
+> D0 期間 80、443、3389 都沒有程式在聽，沒有資料外露。目前狀態見下方〈防火牆現況〉。
+
+## 防火牆現況（2026-11-22 D1-c 後）
+
+| 規則 | 來源 | 連接埠 | 狀態 |
+|---|---|---|---|
+| `allow-ssh-from-iap` | 35.235.240.0/20 | tcp:22 | 啟用 |
+| `default-allow-http` | 0.0.0.0/0 | tcp:80（標記 `http-server`） | 啟用 |
+| `default-allow-https` | 0.0.0.0/0 | tcp:443（標記 `https-server`） | 啟用 |
+| `default-allow-icmp` | 0.0.0.0/0 | icmp | 啟用 |
+| `default-allow-internal` | 10.128.0.0/9 | 全部 | 啟用 |
+| `default-allow-ssh` | 0.0.0.0/0 | tcp:22 | **停用** |
+| `default-allow-rdp` | 0.0.0.0/0 | tcp:3389 | **停用** |
+
+- 對外只有 HTTPS（443）與轉址用的 HTTP（80）；SSH 只能經 IAP（詳見文末〈D1-c〉）。
+- PostgreSQL 不開 TCP（只用 Unix socket）；Caddy 管理介面只聽 `127.0.0.1:2019`。
+- 防火牆有變動時，先更新這張表。
+
+## D0：最小擷取部署
 
 依《YouBike 2.0 專案設計定版 v1.3》11.2。只部署既有的 `collect.py`＋cron＋`flock`，
 目的是提早累積平日尖峰、離峰與週末的真實資料。
@@ -34,7 +52,7 @@
 | 機型 | e2-micro，佈建模型「標準」（非 Spot） |
 | 作業系統 | Ubuntu 24.04 LTS Minimal（x86/64） |
 | 磁碟 | 標準永久磁碟（pd-standard）30 GB，無快照排程、不備份 |
-| 網路 | D0 時外部 IP 臨時；D1-b 起改為固定 IP `youbike-ip`（35.230.112.185）。防火牆見文首更正與〈D1-c〉 |
+| 網路 | D0 時外部 IP 臨時；D1-b 起改為固定 IP `youbike-ip`（35.230.112.185）。防火牆見文首〈防火牆現況〉 |
 | 安全性 | 無服務帳戶；不裝 Ops Agent |
 
 Free Tier 只涵蓋 us-west1／us-central1／us-east1 的 e2-micro 與 30 GB 標準永久磁碟；
@@ -584,23 +602,15 @@ for p in 22 3389 443; do timeout 8 bash -c "</dev/tcp/35.230.112.185/$p" 2>/dev/
 gcloud compute firewall-rules update default-allow-ssh --no-disabled
 ```
 
-### 防火牆現況（2026-11-22 D1-c 後）
+### 防火牆現況
 
-| 規則 | 來源 | 連接埠 | 狀態 |
-|---|---|---|---|
-| `allow-ssh-from-iap` | 35.235.240.0/20 | tcp:22 | 啟用 |
-| `default-allow-http` | 0.0.0.0/0 | tcp:80（標記 `http-server`） | 啟用 |
-| `default-allow-https` | 0.0.0.0/0 | tcp:443（標記 `https-server`） | 啟用 |
-| `default-allow-icmp` | 0.0.0.0/0 | icmp | 啟用 |
-| `default-allow-internal` | 10.128.0.0/9 | 全部 | 啟用 |
-| `default-allow-ssh` | 0.0.0.0/0 | tcp:22 | **停用** |
-| `default-allow-rdp` | 0.0.0.0/0 | tcp:3389 | **停用** |
+見文首〈防火牆現況〉。
 
 ### D1-c 驗收紀錄（2026-11-22，通過）
 
 | 項目 | 結果 | 時間（UTC） |
 |---|---|---|
-| C-1 新增規則、IAP 登入 | `allow-ssh-from-iap` 建立；IAP 登入成功（`youbike-vm`、`briankang0929`） | 10:57 |
+| C-1 新增規則、IAP 登入 | `allow-ssh-from-iap` 建立；IAP 登入成功（`youbike-vm`，個人帳號） | 10:57 |
 | C-2 停用舊規則後 IAP 登入 | `default-allow-ssh`、`default-allow-rdp` 已停用；IAP 登入成功 | 11:02 |
 | C-3 直接連線 | 22 `CLOSED`、3389 `CLOSED`、443 `OPEN`（對照組） | 11:03 |
 | 瀏覽器 SSH | 新開視窗直接連上，`hostname` 為 `youbike-vm`（自動走 IAP） | 11:04 |
