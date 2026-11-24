@@ -11,6 +11,9 @@
 # - LINE 金鑰：EnvironmentFile 前的「-」代表檔案不存在也照常啟動；
 #   沒有金鑰時 /line/webhook 一律 503（fail closed），查詢 API 照常運作。
 #   金鑰在 VM 上的存放方式於 LINE Bot 開工前決定，本檔不建立該檔案。
+# - 並行上限：--limit-concurrency 32（暫定）。連線數或處理中的請求數達到上限時，uvicorn 直接回 503，
+#   避免突發流量把執行緒池（預設 40 條）與連線池（4 條）排隊排滿。uvicorn 的「連線數」包含 Caddy 保留的
+#   閒置 keep-alive 連線；API-3b 以 40 個並行請求實測，確認流量過後不會持續誤回 503，再調整數值。
 # - 記憶體：MemoryHigh 200M（超過時系統開始回收這個服務的記憶體）、MemoryMax 300M（超過即被結束並依
 #   Restart 重啟）。兩者為暫定值，API-3b 實測記憶體、swap、OOM 後調整。
 
@@ -38,6 +41,7 @@ EnvironmentFile=-/etc/youbike/api.env
 ExecStart=/opt/youbike-api/.venv/bin/uvicorn app_main:create_production_app --factory \
     --host 127.0.0.1 --port 8000 --workers 1 \
     --no-access-log --no-server-header \
+    --limit-concurrency 32 \
     --timeout-graceful-shutdown 10
 
 Restart=on-failure

@@ -18,14 +18,19 @@
 #     GET  /stations/nearby
 #     GET  /stations/{station_id}   station_id 只允許英數字、底線、連字號，1～32 字
 #     POST /line/webhook            body 上限 1 MB（應用程式另有同樣的上限）
-# - /healthz 由 Caddy 直接回應（只代表 Caddy 與 HTTPS 正常）；/health 經 FastAPI（代表 API 程序正常）。
+# - GET /healthz 由 Caddy 直接回應（只代表 Caddy 與 HTTPS 正常）；/health 經 FastAPI（代表 API 程序正常）。
+#   /healthz 的其他方法（包括 HEAD、POST）與其他路徑一樣 404。
 # - /ready（檢查資料庫）不對外，只在 VM 本機以 curl http://127.0.0.1:8000/ready 檢查。
 
 youbike-data-mvp.duckdns.org {
 	# 不回傳 Server 標頭（避免透露伺服器軟體）
 	header -Server
 
-	handle /healthz {
+	@healthz {
+		method GET
+		path /healthz
+	}
+	handle @healthz {
 		respond "ok" 200
 	}
 

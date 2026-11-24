@@ -6,6 +6,7 @@
 - 回覆以 reply_func 注入假函式；SDK 回覆路徑另以替換 RESTClientObject.request 檢查送出的 HTTP 請求。
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -15,6 +16,7 @@ import threading
 import time
 
 import pytest
+import urllib3
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from linebot.v3.messaging import ApiException
@@ -25,14 +27,19 @@ import line_webhook
 from line_webhook import (
     MAX_BODY_BYTES,
     MAX_TEXT_LENGTH,
+    REPLY_TIMEOUT_S,
+    USER_LOG_ID_LENGTH,
     WEBHOOK_PATH,
     LineConfig,
     build_echo_text,
     create_line_router,
     derive_user_log_key,
     make_sdk_reply,
+    read_body_limited,
     read_line_config,
+    truncate_utf16,
     user_log_id,
+    utf16_length,
 )
 
 SECRET = "test-channel-secret-0123456789"
@@ -268,6 +275,49 @@ def test_echo_text_is_truncated_to_line_limit():
     assert text.startswith("收到：長")
 
 
+# ================================================================ 文字長度（UTF-16）
+
+APPLE = "\U0001f34e"  # 🍎：BMP 以外的字元，UTF-16 為 2 個 code unit
+
+
+def test_utf16_length_counts_astral_characters_as_two():
+    assert utf16_length("abc") == 3
+    assert utf16_length("臺北") == 2
+    assert utf16_length(APPLE) == 2
+    assert utf16_length("a" + APPLE + "中") == 4
+    assert utf16_length(APPLE) == len(APPLE.encode("utf-16-le")) // 2
+
+
+@pytest.mark.parametrize(
+    "text,limit,expected",
+    [
+        ("a" * 5, 5, "a" * 5),  # 剛好等於上限：不截斷
+        ("a" * 6, 5, "a" * 5),
+        ("abcd" + APPLE, 5, "abcd"),  # 只剩 1 個 code unit：emoji 整個捨棄，不切成半個
+        ("abc" + APPLE, 5, "abc" + APPLE),  # 剛好放得下
+        ("中" + APPLE + "a" + APPLE, 5, "中" + APPLE + "a"),
+        ("", 5, ""),
+    ],
+)
+def test_truncate_utf16_boundaries(text, limit, expected):
+    result = truncate_utf16(text, limit)
+    assert result == expected
+    assert utf16_length(result) <= limit
+    # 結果仍是合法的 UTF-16（沒有落單的 surrogate）
+    result.encode("utf-16-le")
+
+
+def test_echo_of_emoji_text_stays_within_line_limit():
+    # LINE-0 以字元數截斷時，5,000 個 emoji 會變成 9,997 個 code unit，LINE 回 400
+    spy = SpyReply()
+    post(make_client(reply=spy), payload(text_event(APPLE * MAX_TEXT_LENGTH)))
+    ((_, text),) = spy.calls
+    assert utf16_length(text) <= MAX_TEXT_LENGTH
+    assert utf16_length(text) >= MAX_TEXT_LENGTH - 1
+    assert text.startswith("收到：" + APPLE)
+    assert text == build_echo_text(APPLE * MAX_TEXT_LENGTH)
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -293,6 +343,69 @@ def test_oversized_body_is_rejected_before_parsing():
     response = post(make_client(reply=spy), body)
     assert response.status_code == 413
     assert spy.calls == []
+
+
+def chunks_of(body: bytes, size: int = 64 * 1024):
+    # 以產生器送出時，httpx 用 chunked 傳送，不帶 Content-Length
+    for start in range(0, len(body), size):
+        yield body[start : start + size]
+
+
+def test_oversized_chunked_body_without_content_length_is_413():
+    spy = SpyReply()
+    body = payload(text_event("x" * (MAX_BODY_BYTES + 1)))
+    response = make_client(reply=spy).post(
+        WEBHOOK_PATH,
+        content=chunks_of(body),
+        headers={"X-Line-Signature": sign(body), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert spy.calls == []
+
+
+def test_chunked_body_within_limit_is_processed():
+    spy = SpyReply()
+    body = payload(text_event("分段傳送"))
+    response = make_client(reply=spy).post(
+        WEBHOOK_PATH,
+        content=chunks_of(body, size=7),
+        headers={"X-Line-Signature": sign(body), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 200
+    assert spy.calls == [("reply-token-1", "收到：分段傳送")]
+
+
+def test_webhook_never_reads_whole_body_at_once(monkeypatch):
+    # 端點必須經 read_body_limited 邊讀邊檢查，不能呼叫 request.body() 一次讀完
+    from starlette.requests import Request
+
+    async def forbidden_body(self):
+        raise AssertionError("request.body() must not be used")
+
+    monkeypatch.setattr(Request, "body", forbidden_body)
+    spy = SpyReply()
+    response = post(make_client(reply=spy), payload(text_event("你好")))
+    assert response.status_code == 200
+    assert spy.calls == [("reply-token-1", "收到：你好")]
+
+
+def test_read_body_limited_stops_reading_once_over_limit():
+    consumed = []
+
+    class FakeRequest:
+        async def stream(self):
+            for index in range(100):
+                consumed.append(index)
+                yield b"x" * 10
+
+    async def run(limit):
+        return await read_body_limited(FakeRequest(), limit)
+
+    assert asyncio.run(run(25)) is None
+    assert len(consumed) == 3  # 第 3 塊累計 30 > 25 就停，不讀完 100 塊
+    consumed.clear()
+    assert asyncio.run(run(1000)) == b"x" * 1000
+    assert len(consumed) == 100
 
 
 # ================================================================ 日誌不含機密
@@ -354,11 +467,12 @@ def test_user_log_id_is_stable_short_and_keyed():
     key = derive_user_log_key(SECRET)
     first = user_log_id(USER_ID, key)
     assert first == user_log_id(USER_ID, key)
-    assert len(first) == 8 and all(c in "0123456789abcdef" for c in first)
+    assert USER_LOG_ID_LENGTH == 16
+    assert len(first) == 16 and all(c in "0123456789abcdef" for c in first)
     assert first != user_log_id("U" + "f" * 32, key)
     assert first != user_log_id(USER_ID, derive_user_log_key("another-secret"))
     # 不是未加金鑰的 SHA-256（無法用公開的 userId 自行計算比對）
-    assert first != hashlib.sha256(USER_ID.encode()).hexdigest()[:8]
+    assert first != hashlib.sha256(USER_ID.encode()).hexdigest()[:16]
     assert user_log_id(None, key) == "-" and user_log_id("", key) == "-"
 
 
@@ -437,7 +551,13 @@ def test_sdk_reply_sends_expected_http_request(monkeypatch):
         _preload_content=True,
         _request_timeout=None,
     ):
-        captured.update(method=method, url=url, headers=headers, body=body)
+        captured.update(
+            method=method,
+            url=url,
+            headers=headers,
+            body=body,
+            timeout=_request_timeout,
+        )
         return FakeResponse()
 
     monkeypatch.setattr(RESTClientObject, "request", fake_request)
@@ -451,6 +571,32 @@ def test_sdk_reply_sends_expected_http_request(monkeypatch):
         body = json.loads(body)
     assert body["replyToken"] == "reply-token-1"
     assert body["messages"] == [{"type": "text", "text": "收到：你好"}]
+    assert captured["timeout"] == REPLY_TIMEOUT_S
+
+
+def test_sdk_reply_timeout_reaches_urllib3(monkeypatch):
+    # 確認安裝的 SDK 版本真的把 (連線, 讀取) 轉成 urllib3.Timeout，而不是忽略
+    captured = {}
+
+    class FakeUrllib3Response:
+        status = 200
+        reason = "OK"
+        data = b'{"sentMessages": [{"id": "1", "quoteToken": "q"}]}'
+
+        def __init__(self):
+            self.headers = {"content-type": "application/json"}
+
+    def fake_pool_request(self, method, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return FakeUrllib3Response()
+
+    monkeypatch.setattr(urllib3.PoolManager, "request", fake_pool_request)
+    make_sdk_reply(TOKEN)("reply-token-1", "你好")
+
+    timeout = captured["timeout"]
+    assert isinstance(timeout, urllib3.Timeout)
+    assert timeout.connect_timeout == REPLY_TIMEOUT_S[0]
+    assert timeout.read_timeout == REPLY_TIMEOUT_S[1]
 
 
 def test_sdk_invalid_signature_error_is_the_v3_class():

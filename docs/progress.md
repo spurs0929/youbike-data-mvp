@@ -4,9 +4,9 @@
 整體架構與後續規劃以「YouBike 2.0 專案設計定版 v1.3」為準，本文件只記錄已實作的部分。
 
 - 最後更新：2026-11-24
-- 測試數量：648 項（transform 28、collect 39、schema 61、check_health 13、snapshot 100、
-  snapshot_job 129、snapshot_job_db 26、repository 67、repository_db 34、api 69、api_db 10、line_webhook 39、deploy_api 33）。
-  未設定測試資料庫時為 517 passed、131 skipped（schema、snapshot_job_db、repository_db、api_db 共 131 項需要資料庫）。
+- 測試數量：665 項（transform 28、collect 39、schema 61、check_health 13、snapshot 100、
+  snapshot_job 129、snapshot_job_db 26、repository 67、repository_db 34、api 69、api_db 10、line_webhook 52、deploy_api 37）。
+  未設定測試資料庫時為 534 passed、131 skipped（schema、snapshot_job_db、repository_db、api_db 共 131 項需要資料庫）。
   Windows 本機另有 1 項符號連結測試 skip。
 
 ---
@@ -480,7 +480,7 @@ CLI 介面（使用者 11/22 確認）：
     webhook 一律 503，不讀 body、不驗證簽章（不會用空字串當 secret）；查詢 API 照常運作，啟動時寫一筆 WARNING。
 - **不卡住事件迴圈**：讀原始 body 需要 async 端點；SDK 的回覆是同步 HTTP 呼叫，以 `run_in_threadpool` 執行。
 - **日誌**：不記錄 secret、access token、reply token、簽章值、訊息內容與 **LINE userId**；回覆失敗只記例外類型與 HTTP status。
-  每個事件記一行 `type=… user=…`，`user` 為「HMAC-SHA256(由 channel secret 衍生的金鑰, userId)」的十六進位前 8 碼
+  每個事件記一行 `type=… user=…`，`user` 為「HMAC-SHA256(由 channel secret 衍生的金鑰, userId)」的十六進位前 8 碼（review-fixes 改為 16 碼）
   （同一使用者代碼固定、無法反推；沒有 userId 時記 `-`）。衍生金鑰加上用途標籤，與簽章驗證分開。
 - **SDK 注意事項**：
   - `InvalidSignatureError` 必須從 `linebot.v3.exceptions` 匯入；舊版 `linebot.exceptions` 的同名類別是不同的類別，
@@ -495,6 +495,37 @@ CLI 介面（使用者 11/22 確認）：
   Reply API 請求（URL、`Authorization`、replyToken、訊息）；`app_main` 依環境變數掛載與 fail closed。
 - 突變測試：略過簽章驗證、改用舊版例外類別、回覆不放執行緒、拿掉 fail closed、縮小例外範圍、日誌寫入簽章、日誌寫入原始 userId、userId 未加金鑰雜湊、
   不截斷、拿掉缺少簽章檢查，各至少 1 項測試失敗。
+
+### Code Review 修正：LINE-0 與 API-3a（review-fixes，2026-11-24）
+
+只改 repo，VM 未變更（部署在 API-3b）。不新增框架；擷取、`snapshot_job`、repository 與 migration 不變。
+
+- **body 大小**：`request.body()` 會先把整個 body 讀進記憶體才比對大小；沒有 `Content-Length`（chunked）時第一道檢查無效。
+  改用 `read_body_limited()` 以 `request.stream()` 邊讀邊累計，超過 1 MiB 立刻停止並回 413。
+  正式環境前面另有 Caddy 的 `max_size 1MB`，但 ngrok 開發時直接連到 uvicorn。簽章仍以原始 bytes 驗證，狀態碼不變。
+- **Reply API timeout**：SDK 預設不設 timeout（`rest.py` 沒有 `_request_timeout` 時沿用 socket 預設＝無限等待），
+  LINE 沒有回應時會一直佔住執行緒池。改為 `REPLY_TIMEOUT_S = (3.0, 5.0)`（連線、讀取）；
+  SDK 3.14.1（requirements 下限）與 3.27.0 都把 tuple 轉成 `urllib3.Timeout(connect=…, read=…)`，以測試確認確實傳到 urllib3。
+  urllib3 預設對連線失敗重試 3 次，最壞約 4×3＋5＝17 秒；POST 的讀取逾時不重試。
+- **文字長度**：LINE 以 UTF-16 code unit 計算（emoji 等 BMP 以外的字元算 2）。原本以 Python 字元數截斷，
+  5,000 個 emoji 的回覆實際是 9,997 個 code unit，LINE 會回 400。新增 `utf16_length()`、`truncate_utf16()`
+  （不切開 surrogate pair），回覆一律經過它。
+- **日誌使用者代碼**：`USER_LOG_ID_LENGTH` 8 → 16 碼（32 → 64 bit），降低不同使用者代碼相同的機率；
+  有 HMAC 金鑰，長度與能否反推無關。定版 v1.4 8.5 第 1 點「前 8 碼」列入 v1.5 待議。
+- **uvicorn 並行上限**：`--limit-concurrency 32`（暫定）。uvicorn 的連線數包含 Caddy 的閒置 keep-alive 連線，
+  API-3b 驗收第 8 項以 40 個並行請求確認流量過後不會持續誤回 503。
+- **Caddy `/healthz`**：改為具名 matcher，只接受 GET；其他方法 404，與白名單說明一致。
+- **資料庫有效權限檢查**：`default_transaction_read_only` 可被 `SET`／`BEGIN READ WRITE` 蓋掉，不是安全邊界；
+  原本 A-5 的 `DELETE` 檢查是被唯讀交易擋下，沒有驗證到資料表權限。新增 `deploy/api-db-role-check.sql`
+  （角色繼承、角色屬性、資料表與序列有效權限、PUBLIC 授權、schema／資料庫 CREATE），並在 A-5 加上
+  「蓋掉唯讀預設後寫入 → `permission denied for table stations`」。以 PostgreSQL 16.15 依 VM 步驟建庫實測：
+  正常時全部 `t`；故意授予 INSERT、PUBLIC SELECT、角色繼承、schema CREATE、CREATEDB 時對應項目皆為 `f`。
+  `TEMP`（PUBLIC 預設可建立暫存資料表）記為已知限制。
+- **部署紀錄**：A-4 記錄部署 commit、Python 版本與 `pip freeze`，README 新增〈API-3b 部署紀錄〉；正式 lock file 留到 Demo 封板。
+- **測試**（+17）：line_webhook 39 → 52（chunked 超過上限 413、chunked 正常處理、邊讀邊停、端點不呼叫 `request.body()`、timeout 傳入 SDK 與 urllib3、
+  UTF-16 長度與截斷邊界、5,000 個 emoji 的回覆不超過上限、代碼 16 碼）；deploy_api 33 → 37（並行上限、`/healthz` 只接受 GET、
+  權限檢查 SQL 只含查詢且涵蓋各項）。突變測試：改回 `request.body()`、讀完才檢查、拿掉 timeout、改回字元數截斷、
+  emoji 算 1 個 code unit，各至少 1 項失敗。接測試資料庫時 664 passed、1 skipped（PostgreSQL 16.15）。
 
 ---
 

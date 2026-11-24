@@ -68,6 +68,12 @@ def test_unit_binds_localhost_single_worker_without_access_log(unit):
     assert "0.0.0.0" not in exec_start
 
 
+def test_unit_limits_concurrency(unit):
+    (exec_start,) = unit["ExecStart"]
+    args = exec_start.split()
+    assert args[args.index("--limit-concurrency") + 1] == "32"
+
+
 def test_unit_memory_limits(unit):
     assert unit["MemoryHigh"] == ["200M"]
     assert unit["MemoryMax"] == ["300M"]
@@ -115,12 +121,13 @@ def test_caddy_allowlist_is_exact(caddy):
     paths = re.findall(r"^\s*path\s+(.+)$", caddy, flags=re.MULTILINE)
     assert sorted(p.strip() for p in paths) == [
         "/health /stations /stations/nearby",
+        "/healthz",
         "/line/webhook",
     ]
     regexps = re.findall(r"^\s*path_regexp\s+(.+)$", caddy, flags=re.MULTILINE)
     assert regexps == ["^/stations/[A-Za-z0-9_-]{1,32}$"]
     methods = re.findall(r"^\s*method\s+(.+)$", caddy, flags=re.MULTILINE)
-    assert sorted(m.strip() for m in methods) == ["GET", "GET", "POST"]
+    assert sorted(m.strip() for m in methods) == ["GET", "GET", "GET", "POST"]
 
 
 @pytest.mark.parametrize(
@@ -156,7 +163,15 @@ def test_caddy_proxies_only_to_localhost_8000(caddy):
 def test_caddy_webhook_body_limit_and_server_header(caddy):
     assert re.search(r"request_body\s*\{\s*max_size 1MB\s*\}", caddy)
     assert "header -Server" in caddy
-    assert "handle /healthz" in caddy
+
+
+def test_caddy_healthz_is_get_only(caddy):
+    # 每個 handle 都要經具名 matcher（含 method），只有最後的預設 404 沒有條件
+    assert "handle /" not in caddy
+    assert re.search(
+        r"@healthz\s*\{\s*method GET\s*path /healthz\s*\}\s*handle @healthz\s*\{\s*respond \"ok\" 200",
+        caddy,
+    )
 
 
 # ================================================================ 資料庫角色
@@ -190,3 +205,29 @@ def test_role_defense_in_depth_settings(role_sql):
     assert "SET default_transaction_read_only = on" in role_sql
     assert "SET statement_timeout = '5s'" in role_sql
     assert "CONNECTION LIMIT 6" in role_sql
+
+
+# ================================================================ 權限檢查 SQL
+
+
+def test_role_check_sql_is_read_only():
+    # 檢查腳本只能查詢：每個敘述都以 SELECT 或 WITH 開頭
+    text = _without_comments(_read("api-db-role-check.sql"), "--")
+    statements = [s.strip() for s in text.split(";") if s.strip()]
+    assert len(statements) == 8
+    for statement in statements:
+        assert statement.split()[0].upper() in {"SELECT", "WITH"}, statement
+
+
+def test_role_check_sql_covers_effective_privileges():
+    text = _read("api-db-role-check.sql")
+    for needle in (
+        "pg_auth_members",  # 角色繼承
+        "has_table_privilege",
+        "has_sequence_privilege",
+        "aclexplode",  # PUBLIC 授權
+        "has_schema_privilege",
+        "has_database_privilege",
+        "ARRAY['fetch_batches:SELECT', 'station_snapshots:SELECT', 'stations:SELECT']",
+    ):
+        assert needle in text

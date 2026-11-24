@@ -44,6 +44,7 @@
 | `Caddyfile` | `/etc/caddy/Caddyfile` | D1-b：HTTPS 入口；API-3 起以白名單精確比對轉送 API 與 LINE webhook，其他一律 404 |
 | `youbike-api.service` | `/etc/systemd/system/youbike-api.service` | API-3：uvicorn（只綁 127.0.0.1:8000、單一 worker、`youbike_api` 身分、記憶體限制） |
 | `api-db-role.sql` | 不安裝，以 `postgres` 執行一次 | API-3：唯讀資料庫角色 `youbike_api`（三張表 SELECT、預設唯讀交易、查詢逾時、連線上限） |
+| `api-db-role-check.sql` | 不安裝，以 `postgres` 執行 | API-3：`youbike_api` 的有效權限檢查（唯讀；角色繼承、資料表與序列權限、PUBLIC 授權、建立權限） |
 | `unattended-upgrades-caddy` | `/etc/apt/apt.conf.d/52unattended-upgrades-caddy` | D1-b：讓 Caddy 也納入自動更新 |
 
 ## VM 規格（2026-11-20 建立）
@@ -632,13 +633,13 @@ gcloud compute firewall-rules update default-allow-ssh --no-disabled
 | 執行身分 | 系統使用者 `youbike_api`（無登入 shell、無家目錄） |
 | 資料庫角色 | `youbike_api`，**與系統使用者同名（底線）**，peer 驗證直接對應，不使用 `pg_ident.conf`。只有 `stations`、`station_snapshots`、`fetch_batches` 的 SELECT；預設唯讀交易、查詢逾時 5 秒、連線上限 6（連線池最多 4） |
 | 連線字串 | `postgresql:///youbike`（Unix socket、無密碼），寫在 unit 檔 |
-| uvicorn | `127.0.0.1:8000`、`--workers 1`、`--no-access-log`（查詢字串含使用者座標）、`--no-server-header` |
+| uvicorn | `127.0.0.1:8000`、`--workers 1`、`--no-access-log`（查詢字串含使用者座標）、`--no-server-header`、`--limit-concurrency 32`（暫定，見驗收第 8 項） |
 | 記憶體 | `MemoryHigh=200M`、`MemoryMax=300M`（暫定，API-3b 依記憶體、swap、OOM 實測調整） |
 | 權限收斂 | `ProtectSystem=strict`、`ProtectHome=yes`、`NoNewPrivileges`、無 capability、只允許 Unix／IPv4／IPv6 socket 等（見 unit 檔） |
 | LINE 金鑰 | `EnvironmentFile=-/etc/youbike/api.env`（`-`＝檔案不存在也照常啟動）。**API-3 不建立此檔**；沒有金鑰時 `/line/webhook` 一律 503（fail closed）。存放方式於 LINE Bot 開工前決定 |
 | 對外路由 | Caddy 白名單、精確比對、預設 404：`GET /health`、`GET /stations`、`GET /stations/nearby`、`GET /stations/{station_id}`（英數字、`_`、`-`，1～32 字）、`POST /line/webhook`（body ≤ 1 MB） |
 | 不對外 | `/ready`（只在 VM 本機檢查）、`/docs`、`/redoc`、`/openapi.json`，以及白名單以外的方法與路徑 |
-| `/healthz` | 保留，由 Caddy 直接回應（只代表 Caddy 與 HTTPS 正常） |
+| `/healthz` | 保留，只接受 GET，由 Caddy 直接回應（只代表 Caddy 與 HTTPS 正常）；其他方法 404 |
 
 **PostgreSQL peer 驗證**：Unix socket 連線時，PostgreSQL 以連線行程的系統使用者名稱作為資料庫角色名稱，
 兩者必須完全相同。`youbike-api`（連字號）與 `youbike_api`（底線）不同，無法通過。因此系統使用者與角色都命名為
@@ -688,15 +689,55 @@ sudo find /opt/youbike-api -perm /022 -not -type l | head
 
 最後一行應沒有輸出（沒有其他人可寫的檔案）。`compileall` 預先編譯 `.pyc`，因為服務以唯讀方式執行、不會自己寫入快取。
 
+接著記錄實際部署的版本（只讀取，結果貼到〈API-3b 部署紀錄〉）：
+
+```bash
+sudo git -C /opt/youbike-api rev-parse HEAD
+/opt/youbike-api/.venv/bin/python --version
+/opt/youbike-api/.venv/bin/pip freeze
+```
+
+requirements 只寫版本範圍，每次安裝的實際版本可能不同；正式的 lock file 留到 Demo 封板（12/6）。
+
 #### A-5. 建立唯讀資料庫角色
 
 ```bash
 sudo -u postgres psql -d youbike -v ON_ERROR_STOP=1 -f /opt/youbike-api/deploy/api-db-role.sql
 sudo -u youbike_api psql -d youbike -Atc "SELECT current_user, count(*) FROM stations"
-sudo -u youbike_api psql -d youbike -Atc "DELETE FROM stations WHERE false"
 ```
 
-第二行應印出 `youbike_api|<站數>`；第三行應出現 `ERROR:  cannot execute DELETE in a read-only transaction`（寫入被拒，這是預期結果）。
+第二行應印出 `youbike_api|<站數>`。
+
+**有效權限檢查**：`default_transaction_read_only` 只是預設值，連線後可以用 `SET` 或 `BEGIN READ WRITE` 蓋掉，
+不是安全邊界；真正擋住寫入的是資料表權限。因此分兩部分驗證：
+
+```bash
+sudo -u postgres psql -d youbike -v ON_ERROR_STOP=1 -At -F ' | ' -f /opt/youbike-api/deploy/api-db-role-check.sql
+```
+
+預期（`info:database_temp` 之外，第二欄全部為 `t`）：
+
+```text
+member_of | t | (none)
+attributes | t | super=f createrole=f createdb=f replication=f bypassrls=f connlimit=6
+table_privileges | t | fetch_batches:SELECT, station_snapshots:SELECT, stations:SELECT
+sequence_privileges | t | (none)
+public_grants | t | (none)
+schema_create | t | (none)
+database_create | t | false
+info:database_temp |  | true
+```
+
+再實際蓋掉唯讀預設後嘗試寫入：
+
+```bash
+sudo -u youbike_api psql -d youbike -c "SET default_transaction_read_only = off" -c "DELETE FROM stations WHERE false"
+sudo -u youbike_api psql -d youbike -c "DELETE FROM stations WHERE false"
+```
+
+第一行應出現 `ERROR:  permission denied for table stations`（被資料表權限擋下，這才證明沒有寫入權限）；
+第二行應出現 `ERROR:  cannot execute DELETE in a read-only transaction`（預設唯讀交易仍有效，屬縱深防禦）。
+兩行都是預期的錯誤。
 
 #### A-6. 安裝並啟動服務
 
@@ -742,15 +783,39 @@ curl.exe -s -i https://youbike-data-mvp.duckdns.org/stations/a/b
 curl.exe -s -i -X POST https://youbike-data-mvp.duckdns.org/stations
 curl.exe -s -i -X POST https://youbike-data-mvp.duckdns.org/line/webhook -H "X-Line-Signature: x" -d "{}"
 curl.exe -s -i https://youbike-data-mvp.duckdns.org/healthz
+curl.exe -s -i -X POST https://youbike-data-mvp.duckdns.org/healthz
 ```
 
 1. `/health`、兩個查詢、單站：200（單站不存在時 404，內容為 JSON），**沒有 `Server` 標頭**。
 2. `/ready`、`/docs`、`/openapi.json`、`/stations/`、`/stations/a/b`、`POST /stations`：404、內容為空（Caddy 拒絕，沒有到達 API）。
 3. `POST /line/webhook`：503（金鑰未設定，fail closed）。
-4. `/healthz`：200、`ok`。
+4. `GET /healthz`：200、`ok`；`POST /healthz`：404、內容為空。
 5. VM 上：`sudo ss -ltnp` 的 8000 只在 `127.0.0.1`；`/ready` 只能在 VM 本機 `curl http://127.0.0.1:8000/ready` 取得 200。
 6. 連線：`sudo -u postgres psql -d youbike -Atc "SELECT usename, application_name, state FROM pg_stat_activity WHERE usename = 'youbike_api'"`，連線數 ≤ 4，沒有 `idle in transaction`。
 7. 記憶體（API-3 收尾時與 4C 同時量）：`systemctl show youbike-api -p MemoryCurrent -p MemoryPeak`、`free -m`（available ≥ 200 MB）、swap 不持續增加、`journalctl -k | grep -ci oom` 為 0。依結果調整 `MemoryHigh`／`MemoryMax`。
+8. 並行上限（`--limit-concurrency 32`）：uvicorn 的連線數包含 Caddy 保留的閒置 keep-alive 連線，
+   需確認流量過後不會持續誤回 503。【VM】：
+
+   ```bash
+   seq 40 | xargs -P 40 -I{} curl -s -o /dev/null -w '%{http_code}\n' https://youbike-data-mvp.duckdns.org/health | sort | uniq -c
+   sleep 1; curl -s -o /dev/null -w '%{http_code}\n' https://youbike-data-mvp.duckdns.org/health
+   sleep 6; curl -s -o /dev/null -w '%{http_code}\n' https://youbike-data-mvp.duckdns.org/health
+   ```
+
+   - 第一行：40 個並行請求經 Caddy 送到 uvicorn，出現部分 `503` 屬預期（超過上限時直接拒絕）；全部 `200` 也可以。
+   - 第二行：流量剛過 1 秒，記錄結果即可。若為 `503`，代表 Caddy 保留的閒置連線佔滿了上限。
+   - 第三行：等 uvicorn 預設 5 秒關閉閒置連線後，**必須是 `200`**。
+   - 第二行為 `503` 時，再評估調高上限或在 Caddy 設定 `keepalive_idle_conns_per_host`（API-3 收尾時決定）。
+
+### API-3b 部署紀錄
+
+部署後填寫（A-4 的三個指令）：
+
+| 項目 | 值 |
+|---|---|
+| 部署 commit | （待填） |
+| Python | （待填） |
+| `pip freeze` | （待填；完整輸出另存 `docs/`，或貼在本節） |
 
 ### 更新程式（API）
 
@@ -792,4 +857,6 @@ sudo userdel youbike_api
 ### 已知限制
 
 - `youbike_api` 仍可連到預設的 `postgres` 資料庫（PostgreSQL 預設開放 `CONNECT` 給所有角色），但沒有任何資料表權限；不修改，避免影響其他角色。
+- `youbike_api` 可以建立暫存資料表（PostgreSQL 預設開放 `TEMP` 給所有角色；`api-db-role-check.sql` 的 `info:database_temp`）。
+  暫存表只在該連線內存在，不影響正式資料；收回需改 PUBLIC 權限，會波及其他角色，不修改。
 - 之後新增的資料表（migration `002` 起）不會自動授權；API 需要時在對應的 patch 加 `GRANT`。
