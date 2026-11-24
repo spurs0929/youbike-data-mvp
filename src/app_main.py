@@ -1,12 +1,14 @@
 """正式環境進入點：讀環境變數 → 建立連線池與 Repository → create_app（API-2b）。
 
-啟動方式（API-3 才加入 uvicorn 與 systemd）：
+啟動方式（uvicorn 自 LINE-0 起列入 requirements.txt；systemd 在 API-3）：
 
     uvicorn app_main:create_production_app --factory
 
 環境變數：
 - YOUBIKE_DATABASE_URL（必要）：與 4C 相同，VM 上為 postgresql:///youbike（Unix socket＋peer 驗證）。
   未設定或空白時，create_production_app() 直接丟 MissingConfigError，app 不會啟動。
+- LINE_CHANNEL_SECRET、LINE_CHANNEL_ACCESS_TOKEN（LINE-0）：兩個都有設定時 /line/webhook 才會處理請求；
+  任一個未設定或空白時 webhook 一律回 503（fail closed），查詢 API 照常運作，啟動時寫一筆 WARNING。
 
 連線池（psycopg_pool）：
 - min_size=1、max_size=4：一個 app instance 最多 4 條連線。VM 的 max_connections=20，
@@ -23,6 +25,7 @@ api.py 不匯入本模組；測試可以只用 InMemoryStationRepository。
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
@@ -33,7 +36,10 @@ from psycopg_pool import ConnectionPool
 from starlette.concurrency import run_in_threadpool
 
 from api import create_app
+from line_webhook import LineConfig, create_line_router, read_line_config
 from repository import PooledStationRepository
+
+logger = logging.getLogger(__name__)
 
 DATABASE_URL_ENV = "YOUBIKE_DATABASE_URL"
 POOL_MIN_SIZE = 1
@@ -76,8 +82,12 @@ def create_app_with_pool(
     pool: ConnectionPool,
     *,
     clock: Callable[[], datetime] | None = None,
+    line_config: LineConfig | None = None,
 ) -> FastAPI:
-    """以指定的連線池建立 app；lifespan 負責開啟與關閉連線池。clock 只供測試注入。"""
+    """以指定的連線池建立 app；lifespan 負責開啟與關閉連線池。
+
+    line_config 為 None 時 /line/webhook 一律 503（fail closed）。clock 只供測試注入。
+    """
     repo_kwargs = {} if clock is None else {"clock": clock}
     repository = PooledStationRepository(pool, **repo_kwargs)
 
@@ -91,10 +101,18 @@ def create_app_with_pool(
             await run_in_threadpool(pool.close)
 
     app = create_app(repository, readiness_check=repository.ping, lifespan=lifespan)
+    app.include_router(create_line_router(line_config))
     app.state.pool = pool
     return app
 
 
 def create_production_app(environ: Mapping[str, str] | None = None) -> FastAPI:
     """正式環境的 app 工廠。缺少 YOUBIKE_DATABASE_URL 時丟 MissingConfigError。"""
-    return create_app_with_pool(build_pool(read_database_url(environ)))
+    database_url = read_database_url(environ)
+    line_config = read_line_config(environ)
+    if line_config is None:
+        logger.warning(
+            "LINE 金鑰未設定（LINE_CHANNEL_SECRET、LINE_CHANNEL_ACCESS_TOKEN），"
+            "/line/webhook 將一律回 503"
+        )
+    return create_app_with_pool(build_pool(database_url), line_config=line_config)

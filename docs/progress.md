@@ -3,10 +3,10 @@
 記錄每個批次實際完成的內容、做出的設計決策與理由，以及已知限制。
 整體架構與後續規劃以「YouBike 2.0 專案設計定版 v1.3」為準，本文件只記錄已實作的部分。
 
-- 最後更新：2026-11-22
-- 測試數量：576 項（transform 28、collect 39、schema 61、check_health 13、snapshot 100、
-  snapshot_job 129、snapshot_job_db 26、repository 67、repository_db 34、api 69、api_db 10）。
-  未設定測試資料庫時為 445 passed、131 skipped（schema、snapshot_job_db、repository_db、api_db 共 131 項需要資料庫）。
+- 最後更新：2026-11-24
+- 測試數量：615 項（transform 28、collect 39、schema 61、check_health 13、snapshot 100、
+  snapshot_job 129、snapshot_job_db 26、repository 67、repository_db 34、api 69、api_db 10、line_webhook 39）。
+  未設定測試資料庫時為 484 passed、131 skipped（schema、snapshot_job_db、repository_db、api_db 共 131 項需要資料庫）。
   Windows 本機另有 1 項符號連結測試 skip。
 
 ---
@@ -37,6 +37,7 @@ repository.py  StationRepository：最新快照查詢（psycopg_pool 連線池�
       │
       ▼
 api.py / app_main.py  FastAPI 三個查詢端點＋/health、/ready      （API-2a、API-2b）
+      └─ line_webhook.py  POST /line/webhook（LINE 簽章驗證、文字回覆）  （LINE-0）
 ```
 
 `collect.py` 只負責把原始資料保存下來，不碰資料庫。
@@ -439,14 +440,55 @@ CLI 介面（使用者 11/22 確認）：
 
 ---
 
+## LINE Bot（`src/line_webhook.py`）
+
+### LINE-0：Webhook 與文字回覆（2026-11-23）
+
+- **分工**：LINE 協定交給官方 SDK `line-bot-sdk` v3（`WebhookParser` 驗證 `X-Line-Signature` 並解析事件、
+  `MessagingApi` 呼叫 Reply API）；路由、安全邊界與錯誤處理自己寫。冪等、限流、額度、查詢指令在後續階段。
+- **端點**：`POST /line/webhook`（不列入 `/docs`）。文字訊息固定回「收到：<訊息>」，超過 LINE 上限 5,000 字截斷；
+  貼圖、加好友、未知類型等事件略過。
+- **狀態碼**：
+  - 200：簽章正確並處理完畢，包含 LINE 後台 Verify 的空事件、略過的事件，以及回覆失敗（只寫日誌；
+    回 500 會讓 LINE 重送，而 reply token 已用過或過期，重送只會再失敗）。
+  - 400：缺少或錯誤的簽章、body 不是 UTF-8 或不是合法的 webhook JSON；不處理任何事件。
+  - 413：body 超過 1 MiB。
+  - 503：**金鑰未設定時 fail closed**。`LINE_CHANNEL_SECRET`、`LINE_CHANNEL_ACCESS_TOKEN` 任一未設定或空白，
+    webhook 一律 503，不讀 body、不驗證簽章（不會用空字串當 secret）；查詢 API 照常運作，啟動時寫一筆 WARNING。
+- **不卡住事件迴圈**：讀原始 body 需要 async 端點；SDK 的回覆是同步 HTTP 呼叫，以 `run_in_threadpool` 執行。
+- **日誌**：不記錄 secret、access token、reply token、簽章值、訊息內容與 **LINE userId**；回覆失敗只記例外類型與 HTTP status。
+  每個事件記一行 `type=… user=…`，`user` 為「HMAC-SHA256(由 channel secret 衍生的金鑰, userId)」的十六進位前 8 碼
+  （同一使用者代碼固定、無法反推；沒有 userId 時記 `-`）。衍生金鑰加上用途標籤，與簽章驗證分開。
+- **SDK 注意事項**：
+  - `InvalidSignatureError` 必須從 `linebot.v3.exceptions` 匯入；舊版 `linebot.exceptions` 的同名類別是不同的類別，
+    接不到 v3 parser 的例外（簽章錯誤會變成 500）。
+  - SDK 對格式不符的事件不丟例外，而是轉成 `UnknownEvent`（例如文字訊息缺少 `quoteToken`）；測試資料使用 LINE 實際格式。
+  - 版本下限 3.14.1：3.14.0 在 Python 3.10 匯入時有語法錯誤；更早的 3.x 把 aiohttp 鎖在舊版。
+- **依賴**：`line-bot-sdk>=3.14.1,<4`（連帶 aiohttp、pydantic 2 等，記憶體在 API-3 驗收時一起量）、
+  `uvicorn>=0.30,<1`（本機以 ngrok 開發時啟動用；systemd 在 API-3）。
+- **測試**（39 項，不連網）：簽章由測試以 HMAC-SHA256＋base64 自行計算；正確／錯誤／缺少／竄改 body／別的 secret；
+  Verify 空事件；fail closed（含攻擊者以空字串 secret 簽章）；多事件依序回覆；回覆失敗仍 200 且不影響其他事件；
+  格式錯誤 400；超過大小 413；日誌不含機密與原始 userId（含群組、回覆失敗、非文字事件路徑）、只出現 HMAC 代碼；回覆進行中 `/health` 仍可回應；以替換 HTTP 層檢查 SDK 送出的
+  Reply API 請求（URL、`Authorization`、replyToken、訊息）；`app_main` 依環境變數掛載與 fail closed。
+- 突變測試：略過簽章驗證、改用舊版例外類別、回覆不放執行緒、拿掉 fail closed、縮小例外範圍、日誌寫入簽章、日誌寫入原始 userId、userId 未加金鑰雜湊、
+  不截斷、拿掉缺少簽章檢查，各至少 1 項測試失敗。
+
+---
+
 ## 下一步
 
 12/11 必要功能：資料擷取、資料庫、API、LINE Bot、LLM Function Calling。
 
 1. **API-3（部署）**：systemd 服務、uvicorn 只綁 `127.0.0.1`、Caddy `reverse_proxy`；API 專用的唯讀資料庫角色；
    VM 上的記憶體與查詢計畫驗收。
-2. **LINE Bot**：簽章驗證、`webhookEventId` 冪等、定位查詢、固定指令；限流與額度。
-3. **LLM Function Calling**：最小範圍 1～2 個工具。
+2. **LINE Bot**：`webhookEventId` 冪等、定位查詢、固定指令；限流與額度（簽章驗證與文字回覆已在 LINE-0 完成）。
+   個資處理（2026-11-23 決定）：
+   - **migration `002` 建表時，LINE userId 一律存 HMAC 值、不存原始值**，並設定保存期限（期限與清理方式建表時決定）。
+     建議（建表時確認）：資料表用的 HMAC 金鑰與日誌用的衍生金鑰分開管理（例如獨立環境變數），
+     避免 channel secret 重新發行後所有已存的雜湊值失效。日誌代碼隨 channel secret 改變可以接受。
+   - follow（加好友）事件回覆歡迎訊息時**附隱私說明**：記錄哪些資料、用途、保存多久。
+3. **LLM Function Calling**：最小範圍 1～2 個工具。送給 OpenAI 之前先做 **PII 遮罩**（例如電話、email、身分證字號等），
+   且不送出 LINE userId。
 
 已決定、不再列為待辦：擷取排程執行環境與原始檔儲存位置（A1、A2：GCP e2-micro、VM 持久磁碟）、
-4C-2、4C-3、D1（2026-11-22 完成）、API-1、API-2a、API-2b（2026-11-22 完成）。
+4C-2、4C-3、D1（2026-11-22 完成）、API-1、API-2a、API-2b（2026-11-22 完成）、LINE-0 程式與測試（2026-11-24；LINE 後台與手機實測待本機驗收）。
