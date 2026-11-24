@@ -4,9 +4,9 @@
 整體架構與後續規劃以「YouBike 2.0 專案設計定版 v1.3」為準，本文件只記錄已實作的部分。
 
 - 最後更新：2026-11-24
-- 測試數量：615 項（transform 28、collect 39、schema 61、check_health 13、snapshot 100、
-  snapshot_job 129、snapshot_job_db 26、repository 67、repository_db 34、api 69、api_db 10、line_webhook 39）。
-  未設定測試資料庫時為 484 passed、131 skipped（schema、snapshot_job_db、repository_db、api_db 共 131 項需要資料庫）。
+- 測試數量：648 項（transform 28、collect 39、schema 61、check_health 13、snapshot 100、
+  snapshot_job 129、snapshot_job_db 26、repository 67、repository_db 34、api 69、api_db 10、line_webhook 39、deploy_api 33）。
+  未設定測試資料庫時為 517 passed、131 skipped（schema、snapshot_job_db、repository_db、api_db 共 131 項需要資料庫）。
   Windows 本機另有 1 項符號連結測試 skip。
 
 ---
@@ -45,7 +45,8 @@ api.py / app_main.py  FastAPI 三個查詢端點＋/health、/ready      （API-
 兩者只透過資料目錄銜接，擷取不受資料庫狀態影響。
 
 部署：GCP e2-micro 上以 cron 每分鐘執行 `collect.py`（D0），每 5 分鐘執行 `snapshot_job.py`（D1），見下方。
-API 尚未部署（API-3）。
+API 尚未部署：API-3a 的部署檔已在 repo（`deploy/youbike-api.service`、`deploy/api-db-role.sql`、`deploy/Caddyfile`），
+VM 安裝在 API-3b。
 
 ---
 
@@ -438,6 +439,28 @@ CLI 介面（使用者 11/22 確認）：
 - **已知限制**：連線池關閉後不能重新開啟，一個 app 物件只能經歷一次 lifespan（uvicorn 正常使用不受影響）。
   資料過期提示不在 API-2b 範圍（LINE Bot 顯示時再決定）。
 
+### API-3a：部署檔（2026-11-23，只改 repo，VM 未變更）
+
+- **`deploy/youbike-api.service`**：uvicorn 只綁 `127.0.0.1:8000`、單一 worker、`--no-access-log`（查詢字串含使用者座標）；
+  以系統使用者 `youbike_api` 執行；程式與虛擬環境放 `/opt/youbike-api`（root 擁有、服務唯讀），不使用 `/home/youbike`；
+  `MemoryHigh=200M`、`MemoryMax=300M`（暫定，API-3b 依記憶體、swap、OOM 實測調整）；`ProtectSystem=strict` 等權限收斂；
+  LINE 金鑰以 `EnvironmentFile=-/etc/youbike/api.env` 預留（檔案不存在時照常啟動，webhook fail closed）。
+- **`deploy/api-db-role.sql`**：唯讀角色 `youbike_api`。peer 驗證要求系統使用者名稱＝角色名稱，兩者都用底線命名，
+  不依賴 `pg_ident.conf`。只有三張表的 SELECT；預設唯讀交易、查詢逾時 5 秒、閒置交易 30 秒、連線上限 6。可重複執行。
+- **`deploy/Caddyfile`**：白名單、精確比對、預設 404。只轉送 `GET /health`、`GET /stations`、`GET /stations/nearby`、
+  `GET /stations/{station_id}`（`^/stations/[A-Za-z0-9_-]{1,32}$`）、`POST /line/webhook`（body ≤ 1 MB）；
+  `/ready`、`/docs`、`/openapi.json` 等不對外。`/healthz` 保留。
+- **`deploy/README.md`〈API-3〉**：設計、安裝步驟（API-3b）、驗收、更新程式、回滾、已知限制。
+- **測試**（`tests/test_deploy_api.py`，33 項，靜態檢查）：unit 檔身分、綁定、worker、access log、記憶體、權限收斂；
+  Caddyfile 無萬用字元、白名單、站號正規式邊界、預設 404、只轉送本機；SQL 只有 SELECT、唯讀與逾時設定。
+  突變測試：改 worker 數、綁 0.0.0.0、使用者改連字號、拿掉 `--no-access-log`、放寬記憶體與 `ProtectSystem`、
+  加萬用字元或 `/ready`、放寬站號正規式、預設改 200、轉送到非本機、加 INSERT、關閉唯讀、多授權一張表，各至少 1 項失敗。
+- **雲端預演**（Ubuntu 24.04＋PostgreSQL 16，與 VM 相同；未使用 systemd）：建立 `youbike` 資料庫與 migration、
+  執行角色 SQL（兩次）、以 `youbike_api` 身分透過 peer 驗證連線；寫入被拒（唯讀交易、無表權限、無 `station_hourly_stats` 權限）；
+  以 unit 檔的參數啟動 uvicorn，`/health`、`/ready`、三個查詢 200、沒有 `server` 標頭、webhook 503、連線 `application_name=youbike-api`、
+  常駐記憶體約 113 MB（Python 3.13）；回滾 SQL（`DROP OWNED BY`＋`DROP ROLE`）後可重建。`systemd-analyze verify` 只回報
+  `/opt/youbike-api/.venv/bin/uvicorn` 不存在（預期）。Caddyfile 未在雲端驗證，API-3b 以 `caddy validate` 檢查。
+
 ---
 
 ## LINE Bot（`src/line_webhook.py`）
@@ -479,7 +502,7 @@ CLI 介面（使用者 11/22 確認）：
 
 12/11 必要功能：資料擷取、資料庫、API、LINE Bot、LLM Function Calling。
 
-1. **API-3（部署）**：systemd 服務、uvicorn 只綁 `127.0.0.1`、Caddy `reverse_proxy`；API 專用的唯讀資料庫角色；
+1. **API-3b（部署）**：依 `deploy/README.md`〈API-3〉在 VM 安裝（API-3a 部署檔已完成）；
    VM 上的記憶體與查詢計畫驗收。
 2. **LINE Bot**：`webhookEventId` 冪等、定位查詢、固定指令；限流與額度（簽章驗證與文字回覆已在 LINE-0 完成）。
    個資處理（2026-11-23 決定）：

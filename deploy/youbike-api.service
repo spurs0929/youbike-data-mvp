@@ -1,0 +1,76 @@
+# YouBike API-3：FastAPI（uvicorn）的 systemd 服務
+# 安裝到 /etc/systemd/system/youbike-api.service（擁有者 root、權限 644），步驟見 deploy/README.md〈API-3〉。
+#
+# - 程式與虛擬環境放在 /opt/youbike-api（root 擁有，服務只能讀，不能改程式）。
+#   不使用 /home/youbike：那是擷取與 4C 的使用者，家目錄與 data/、logs/ 不開放給 API。
+# - 執行身分 youbike_api（系統使用者，無登入 shell、無家目錄）。
+#   PostgreSQL peer 驗證要求「系統使用者名稱＝資料庫角色名稱」，兩邊都叫 youbike_api（底線），
+#   不依賴 pg_ident.conf 對應表。角色只有 SELECT 權限，見 deploy/api-db-role.sql。
+# - 只綁 127.0.0.1:8000，由 Caddy 轉送；單一 worker（e2-micro 1 GB；連線池上限 4 條以單一 instance 計算）。
+# - 不開 uvicorn access log：/stations/nearby 的查詢字串含使用者座標（定版 v1.4 8.5）。
+# - LINE 金鑰：EnvironmentFile 前的「-」代表檔案不存在也照常啟動；
+#   沒有金鑰時 /line/webhook 一律 503（fail closed），查詢 API 照常運作。
+#   金鑰在 VM 上的存放方式於 LINE Bot 開工前決定，本檔不建立該檔案。
+# - 記憶體：MemoryHigh 200M（超過時系統開始回收這個服務的記憶體）、MemoryMax 300M（超過即被結束並依
+#   Restart 重啟）。兩者為暫定值，API-3b 實測記憶體、swap、OOM 後調整。
+
+[Unit]
+Description=YouBike API (FastAPI / uvicorn)
+Documentation=https://github.com/spurs0929/youbike-data-mvp/blob/main/deploy/README.md
+After=network.target postgresql.service
+Wants=postgresql.service
+# 5 分鐘內重啟超過 5 次就停止重試，避免無限重啟
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=youbike_api
+Group=youbike_api
+WorkingDirectory=/opt/youbike-api/src
+
+# 三個斜線＝本機 Unix socket；peer 驗證以系統使用者 youbike_api 對應同名角色，沒有密碼
+Environment=YOUBIKE_DATABASE_URL=postgresql:///youbike
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/etc/youbike/api.env
+
+ExecStart=/opt/youbike-api/.venv/bin/uvicorn app_main:create_production_app --factory \
+    --host 127.0.0.1 --port 8000 --workers 1 \
+    --no-access-log --no-server-header \
+    --timeout-graceful-shutdown 10
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# 資源限制（暫定，API-3b 實測後調整）
+MemoryHigh=200M
+MemoryMax=300M
+TasksMax=64
+
+# 權限收斂：服務不需要寫入任何檔案，也不需要任何特權
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# AF_UNIX：PostgreSQL socket；AF_INET/INET6：監聽 127.0.0.1、呼叫 LINE Reply API
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

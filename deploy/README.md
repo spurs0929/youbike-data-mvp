@@ -1,6 +1,6 @@
-# 部署（GCP e2-micro）：D0 最小擷取、D1 完整部署
+# 部署（GCP e2-micro）：D0 最小擷取、D1 完整部署、API-3
 
-> **D1-a（PostgreSQL 與 4C 排程）、D1-b（固定 IP、網域、Caddy HTTPS）、D1-c（SSH 只經 IAP）見文末各節。** 以下到〈更新程式〉為止是 D0 的內容與紀錄。
+> **D1-a（PostgreSQL 與 4C 排程）、D1-b（固定 IP、網域、Caddy HTTPS）、D1-c（SSH 只經 IAP）、API-3（FastAPI 對外）見文末各節。** 以下到〈更新程式〉為止是 D0 的內容與紀錄。
 >
 > **防火牆紀錄更正（2026-11-22）**：D0 時記為「防火牆只開 SSH」有誤。建立 VM 時勾選了「允許 HTTP／HTTPS 流量」，
 > 加上 GCP 預設網路本來就有的規則，實際對外開放的是 SSH（22）、HTTP（80）、HTTPS（443）、RDP（3389）、ICMP。
@@ -41,7 +41,9 @@
 | `journald-youbike.conf` | `/etc/systemd/journald.conf.d/youbike.conf` | 系統日誌保留 14 天、最多 200 MB |
 | `env.example` | 不安裝 | 環境變數說明（`YOUBIKE_DATA_DIR`；D1-a 起加上 `YOUBIKE_DATABASE_URL`） |
 | `postgresql-youbike.conf` | `/etc/postgresql/16/main/conf.d/youbike.conf` | D1-a：只用 Unix socket、`max_connections`、`shared_buffers` |
-| `Caddyfile` | `/etc/caddy/Caddyfile` | D1-b：HTTPS 入口，只有 `/healthz`，其他路徑 404 |
+| `Caddyfile` | `/etc/caddy/Caddyfile` | D1-b：HTTPS 入口；API-3 起以白名單精確比對轉送 API 與 LINE webhook，其他一律 404 |
+| `youbike-api.service` | `/etc/systemd/system/youbike-api.service` | API-3：uvicorn（只綁 127.0.0.1:8000、單一 worker、`youbike_api` 身分、記憶體限制） |
+| `api-db-role.sql` | 不安裝，以 `postgres` 執行一次 | API-3：唯讀資料庫角色 `youbike_api`（三張表 SELECT、預設唯讀交易、查詢逾時、連線上限） |
 | `unattended-upgrades-caddy` | `/etc/apt/apt.conf.d/52unattended-upgrades-caddy` | D1-b：讓 Caddy 也納入自動更新 |
 
 ## VM 規格（2026-11-20 建立）
@@ -614,3 +616,180 @@ gcloud compute firewall-rules update default-allow-ssh --no-disabled
 | C-2 停用舊規則後 IAP 登入 | `default-allow-ssh`、`default-allow-rdp` 已停用；IAP 登入成功 | 11:02 |
 | C-3 直接連線 | 22 `CLOSED`、3389 `CLOSED`、443 `OPEN`（對照組） | 11:03 |
 | 瀏覽器 SSH | 新開視窗直接連上，`hostname` 為 `youbike-vm`（自動走 IAP） | 11:04 |
+
+---
+
+## API-3：FastAPI 對外（systemd＋Caddy）
+
+依《YouBike 2.0 專案設計定版 v1.4》第七節、8.5。API-3a 只修改 repo；**實際安裝在 API-3b，一步一步進行**，
+本節是安裝與回滾的參考。
+
+### 設計
+
+| 項目 | 決定 |
+|---|---|
+| 程式位置 | `/opt/youbike-api`：另一份 repo checkout＋自己的 `.venv`，**root 擁有**，服務只能讀。不使用 `/home/youbike`（擷取與 4C 的家目錄、`data/`、`logs/` 不開放給 API） |
+| 執行身分 | 系統使用者 `youbike_api`（無登入 shell、無家目錄） |
+| 資料庫角色 | `youbike_api`，**與系統使用者同名（底線）**，peer 驗證直接對應，不使用 `pg_ident.conf`。只有 `stations`、`station_snapshots`、`fetch_batches` 的 SELECT；預設唯讀交易、查詢逾時 5 秒、連線上限 6（連線池最多 4） |
+| 連線字串 | `postgresql:///youbike`（Unix socket、無密碼），寫在 unit 檔 |
+| uvicorn | `127.0.0.1:8000`、`--workers 1`、`--no-access-log`（查詢字串含使用者座標）、`--no-server-header` |
+| 記憶體 | `MemoryHigh=200M`、`MemoryMax=300M`（暫定，API-3b 依記憶體、swap、OOM 實測調整） |
+| 權限收斂 | `ProtectSystem=strict`、`ProtectHome=yes`、`NoNewPrivileges`、無 capability、只允許 Unix／IPv4／IPv6 socket 等（見 unit 檔） |
+| LINE 金鑰 | `EnvironmentFile=-/etc/youbike/api.env`（`-`＝檔案不存在也照常啟動）。**API-3 不建立此檔**；沒有金鑰時 `/line/webhook` 一律 503（fail closed）。存放方式於 LINE Bot 開工前決定 |
+| 對外路由 | Caddy 白名單、精確比對、預設 404：`GET /health`、`GET /stations`、`GET /stations/nearby`、`GET /stations/{station_id}`（英數字、`_`、`-`，1～32 字）、`POST /line/webhook`（body ≤ 1 MB） |
+| 不對外 | `/ready`（只在 VM 本機檢查）、`/docs`、`/redoc`、`/openapi.json`，以及白名單以外的方法與路徑 |
+| `/healthz` | 保留，由 Caddy 直接回應（只代表 Caddy 與 HTTPS 正常） |
+
+**PostgreSQL peer 驗證**：Unix socket 連線時，PostgreSQL 以連線行程的系統使用者名稱作為資料庫角色名稱，
+兩者必須完全相同。`youbike-api`（連字號）與 `youbike_api`（底線）不同，無法通過。因此系統使用者與角色都命名為
+`youbike_api`；Linux 使用者名稱可以使用底線。
+
+### 安裝步驟（API-3b，VM）
+
+以下每一步都先做唯讀檢查，再修改。步驟中的 `<舊版>` 等角括號內容要替換，其餘照貼。
+
+#### A-1. 安裝前檢查（唯讀）
+
+```bash
+free -m
+df -h /
+systemctl is-active postgresql caddy
+sudo ss -ltnp
+id youbike_api 2>&1
+ls -ld /opt/youbike-api 2>&1
+sudo -u postgres psql -d youbike -Atc "SELECT rolname FROM pg_roles WHERE rolname = 'youbike_api'"
+```
+
+預期：`youbike_api` 使用者、`/opt/youbike-api`、`youbike_api` 角色都還不存在；8000 port 沒有程式在聽。
+
+#### A-2. 備份目前的 Caddyfile
+
+```bash
+sudo cp -p /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak-d1b
+```
+
+#### A-3. 建立系統使用者
+
+```bash
+sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin youbike_api
+id youbike_api
+```
+
+#### A-4. 建立 `/opt/youbike-api`（程式＋虛擬環境，root 擁有）
+
+```bash
+sudo git clone https://github.com/spurs0929/youbike-data-mvp.git /opt/youbike-api
+sudo git -C /opt/youbike-api log --oneline -1
+sudo python3 -m venv /opt/youbike-api/.venv
+sudo /opt/youbike-api/.venv/bin/pip install -r /opt/youbike-api/requirements.txt
+sudo /opt/youbike-api/.venv/bin/python -m compileall -q /opt/youbike-api/src
+sudo find /opt/youbike-api -perm /022 -not -type l | head
+```
+
+最後一行應沒有輸出（沒有其他人可寫的檔案）。`compileall` 預先編譯 `.pyc`，因為服務以唯讀方式執行、不會自己寫入快取。
+
+#### A-5. 建立唯讀資料庫角色
+
+```bash
+sudo -u postgres psql -d youbike -v ON_ERROR_STOP=1 -f /opt/youbike-api/deploy/api-db-role.sql
+sudo -u youbike_api psql -d youbike -Atc "SELECT current_user, count(*) FROM stations"
+sudo -u youbike_api psql -d youbike -Atc "DELETE FROM stations WHERE false"
+```
+
+第二行應印出 `youbike_api|<站數>`；第三行應出現 `ERROR:  cannot execute DELETE in a read-only transaction`（寫入被拒，這是預期結果）。
+
+#### A-6. 安裝並啟動服務
+
+```bash
+sudo install -m 644 -o root -g root /opt/youbike-api/deploy/youbike-api.service /etc/systemd/system/youbike-api.service
+sudo systemd-analyze verify /etc/systemd/system/youbike-api.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now youbike-api
+sleep 5
+systemctl is-active youbike-api
+curl -s http://127.0.0.1:8000/health; echo
+curl -s http://127.0.0.1:8000/ready; echo
+sudo journalctl -u youbike-api --since "-5 min" --no-pager | tail -20
+```
+
+預期：`active`、`{"status":"ok"}`、`{"status":"ready"}`；日誌出現一筆「LINE 金鑰未設定 … 一律回 503」（金鑰尚未設定，屬預期）。
+
+#### A-7. 安裝新的 Caddyfile 並 reload
+
+```bash
+sudo install -m 644 -o root -g root /opt/youbike-api/deploy/Caddyfile /etc/caddy/Caddyfile
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl reload caddy
+systemctl is-active caddy
+```
+
+`validate` 最後應出現 `Valid configuration`；沒有出現時**不要 reload**，改做〈回滾〉的 Caddy 部分。
+
+### 驗收
+
+【本機 PowerShell】：
+
+```powershell
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/health
+curl.exe -s -i "https://youbike-data-mvp.duckdns.org/stations?q=%E5%8F%B0%E5%A4%A7&limit=3"
+curl.exe -s -i "https://youbike-data-mvp.duckdns.org/stations/nearby?lat=25.0330&lng=121.5654&radius_m=500&limit=3"
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/stations/500101001
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/ready
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/docs
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/openapi.json
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/stations/
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/stations/a/b
+curl.exe -s -i -X POST https://youbike-data-mvp.duckdns.org/stations
+curl.exe -s -i -X POST https://youbike-data-mvp.duckdns.org/line/webhook -H "X-Line-Signature: x" -d "{}"
+curl.exe -s -i https://youbike-data-mvp.duckdns.org/healthz
+```
+
+1. `/health`、兩個查詢、單站：200（單站不存在時 404，內容為 JSON），**沒有 `Server` 標頭**。
+2. `/ready`、`/docs`、`/openapi.json`、`/stations/`、`/stations/a/b`、`POST /stations`：404、內容為空（Caddy 拒絕，沒有到達 API）。
+3. `POST /line/webhook`：503（金鑰未設定，fail closed）。
+4. `/healthz`：200、`ok`。
+5. VM 上：`sudo ss -ltnp` 的 8000 只在 `127.0.0.1`；`/ready` 只能在 VM 本機 `curl http://127.0.0.1:8000/ready` 取得 200。
+6. 連線：`sudo -u postgres psql -d youbike -Atc "SELECT usename, application_name, state FROM pg_stat_activity WHERE usename = 'youbike_api'"`，連線數 ≤ 4，沒有 `idle in transaction`。
+7. 記憶體（API-3 收尾時與 4C 同時量）：`systemctl show youbike-api -p MemoryCurrent -p MemoryPeak`、`free -m`（available ≥ 200 MB）、swap 不持續增加、`journalctl -k | grep -ci oom` 為 0。依結果調整 `MemoryHigh`／`MemoryMax`。
+
+### 更新程式（API）
+
+```bash
+sudo git -C /opt/youbike-api pull --ff-only
+sudo /opt/youbike-api/.venv/bin/pip install -r /opt/youbike-api/requirements.txt
+sudo /opt/youbike-api/.venv/bin/python -m compileall -q /opt/youbike-api/src
+sudo systemctl restart youbike-api
+```
+
+`/opt/youbike-api` 與 `/home/youbike/youbike-data-mvp` 是兩份 checkout，各自更新；`deploy/` 的設定檔以其中任一份安裝皆可，
+本節一律從 `/opt/youbike-api` 安裝。unit 檔有變更時需重新 `install`＋`daemon-reload`＋`restart`。
+
+### 回滾
+
+依安裝的相反順序；只做到哪一步，就從那一步往回做。
+
+```bash
+# Caddy：還原 D1-b 的設定
+sudo install -m 644 -o root -g root /etc/caddy/Caddyfile.bak-d1b /etc/caddy/Caddyfile
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl reload caddy
+
+# 服務
+sudo systemctl disable --now youbike-api
+sudo rm /etc/systemd/system/youbike-api.service
+sudo systemctl daemon-reload
+
+# 資料庫角色（先收回權限再刪除）
+sudo -u postgres psql -d youbike -v ON_ERROR_STOP=1 -c "DROP OWNED BY youbike_api" -c "DROP ROLE youbike_api"
+
+# 程式與使用者
+sudo rm -rf /opt/youbike-api
+sudo userdel youbike_api
+```
+
+回滾不影響擷取（cron）與 4C：兩者以 `youbike` 身分從 `/home/youbike` 執行，與本節無關。
+
+### 已知限制
+
+- `youbike_api` 仍可連到預設的 `postgres` 資料庫（PostgreSQL 預設開放 `CONNECT` 給所有角色），但沒有任何資料表權限；不修改，避免影響其他角色。
+- 之後新增的資料表（migration `002` 起）不會自動授權；API 需要時在對應的 patch 加 `GRANT`。
