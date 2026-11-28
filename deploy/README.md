@@ -111,8 +111,11 @@ sudo -iu youbike
 git clone https://github.com/spurs0929/youbike-data-mvp.git
 cd youbike-data-mvp
 python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 ```
+
+`python3 -m venv` 建立的 venv 內附 Ubuntu 打包的 pip（24.0，有已知漏洞），先升級再安裝套件（見 API-3〈A-4〉）。
 
 D0 只用到 `requests`，但仍安裝完整的 `requirements.txt`，D1 不必重裝。
 1 GB 記憶體安裝 pandas 時會用到 swap，速度慢屬正常。
@@ -235,8 +238,12 @@ du -sh /home/youbike/data
 ```bash
 sudo -iu youbike
 cd youbike-data-mvp && git pull --ff-only
+.venv/bin/pip install --upgrade pip
 exit
 ```
+
+`pip install --upgrade pip` 已是最新版時只會顯示 `Requirement already satisfied`，無害；requirements 有變更時，
+在 `exit` 前再執行 `.venv/bin/pip install -r requirements.txt`。
 
 `deploy/crontab.txt` 有變更時，需重新執行第 4 步的 `sudo crontab -u youbike ...`；
 logrotate、journald 設定有變更時，重新執行第 5 步。
@@ -682,12 +689,15 @@ id youbike_api
 sudo git clone https://github.com/spurs0929/youbike-data-mvp.git /opt/youbike-api
 sudo git -C /opt/youbike-api log --oneline -1
 sudo python3 -m venv /opt/youbike-api/.venv
+sudo /opt/youbike-api/.venv/bin/pip install --upgrade pip
 sudo /opt/youbike-api/.venv/bin/pip install -r /opt/youbike-api/requirements.txt
 sudo /opt/youbike-api/.venv/bin/python -m compileall -q /opt/youbike-api/src
 sudo find /opt/youbike-api -perm /022 -not -type l | head
 ```
 
-最後一行應沒有輸出（沒有其他人可寫的檔案）。`compileall` 預先編譯 `.pyc`，因為服務以唯讀方式執行、不會自己寫入快取。
+最後一行應沒有輸出（沒有其他人可寫的檔案）。
+`python3 -m venv` 建立的 venv 內附 Ubuntu 打包的 pip（Ubuntu 24.04 為 24.0，11/28 檢查有 6 個已知漏洞），
+所以先升級 pip 再安裝套件；pip 只在安裝時使用，服務執行時不會用到。`compileall` 預先編譯 `.pyc`，因為服務以唯讀方式執行、不會自己寫入快取。
 
 接著記錄實際部署的版本（只讀取，結果貼到〈API-3b 部署紀錄〉）：
 
@@ -715,6 +725,8 @@ sudo -u youbike_api psql -d youbike -Atc "SELECT current_user, count(*) FROM sta
 sudo -u postgres psql -d youbike -v ON_ERROR_STOP=1 -At -F ' | ' -f /opt/youbike-api/deploy/api-db-role-check.sql
 ```
 
+接著在同一個視窗執行 `echo $?`（顯示上一個指令的結束代碼），應為 `0`。
+
 預期（`info:database_temp` 之外，第二欄全部為 `t`）：
 
 ```text
@@ -725,8 +737,12 @@ sequence_privileges | t | (none)
 public_grants | t | (none)
 schema_create | t | (none)
 database_create | t | false
-info:database_temp |  | true
+info:database_temp | | true
+result | t | 7 項全部通過
 ```
+
+任何一項為 `f` 時，最後一行是 `result | f | ...`，接著出現 `ERROR:  api-db-role-check: 有檢查項目未通過`，
+`echo $?` 為 `3`（角色不存在等查詢錯誤也是 `3`）。腳本內已設定 `ON_ERROR_STOP`，命令列少了 `-v ON_ERROR_STOP=1` 也一樣。
 
 再實際蓋掉唯讀預設後嘗試寫入：
 
@@ -757,6 +773,16 @@ sudo journalctl -u youbike-api --since "-5 min" --no-pager | tail -20
 
 #### A-7. 安裝新的 Caddyfile 並 reload
 
+先檢查 repo 內的新檔，確認無誤才覆蓋正式設定（正式設定在檢查通過前不會被動到）：
+
+```bash
+sudo caddy validate --config /opt/youbike-api/deploy/Caddyfile --adapter caddyfile
+```
+
+最後應出現 `Valid configuration`。**沒有出現就停在這裡**：正式設定沒有變動，不需要回滾。
+
+通過後再覆蓋、再檢查一次正式位置的檔案，然後 reload：
+
 ```bash
 sudo install -m 644 -o root -g root /opt/youbike-api/deploy/Caddyfile /etc/caddy/Caddyfile
 sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
@@ -764,7 +790,8 @@ sudo systemctl reload caddy
 systemctl is-active caddy
 ```
 
-`validate` 最後應出現 `Valid configuration`；沒有出現時**不要 reload**，改做〈回滾〉的 Caddy 部分。
+第二次 `validate` 也應出現 `Valid configuration`；沒有出現時**不要 reload**，改做〈回滾〉的 Caddy 部分。
+`reload` 沒有輸出屬正常，`is-active` 應為 `active`。
 
 ### 驗收
 
@@ -786,9 +813,9 @@ curl.exe -s -i https://youbike-data-mvp.duckdns.org/healthz
 curl.exe -s -i -X POST https://youbike-data-mvp.duckdns.org/healthz
 ```
 
-1. `/health`、兩個查詢、單站：200（單站不存在時 404，內容為 JSON），**沒有 `Server` 標頭**。
+1. `/health`、兩個查詢、單站：200（單站不存在時 404，內容為 JSON），**沒有 `Server`、`Via` 標頭**。
 2. `/ready`、`/docs`、`/openapi.json`、`/stations/`、`/stations/a/b`、`POST /stations`：404、內容為空（Caddy 拒絕，沒有到達 API）。
-3. `POST /line/webhook`：503（金鑰未設定，fail closed）。
+3. `POST /line/webhook`：503（金鑰未設定，fail closed），沒有 `Via` 標頭。
 4. `GET /healthz`：200、`ok`；`POST /healthz`：404、內容為空。
 5. VM 上：`sudo ss -ltnp` 的 8000 只在 `127.0.0.1`；`/ready` 只能在 VM 本機 `curl http://127.0.0.1:8000/ready` 取得 200。
 6. 連線：`sudo -u postgres psql -d youbike -Atc "SELECT usename, application_name, state FROM pg_stat_activity WHERE usename = 'youbike_api'"`，連線數 ≤ 4，沒有 `idle in transaction`。
@@ -806,28 +833,77 @@ curl.exe -s -i -X POST https://youbike-data-mvp.duckdns.org/healthz
    - 第二行：流量剛過 1 秒，記錄結果即可。若為 `503`，代表 Caddy 保留的閒置連線佔滿了上限。
    - 第三行：等 uvicorn 預設 5 秒關閉閒置連線後，**必須是 `200`**。
    - 第二行為 `503` 時，再評估調高上限或在 Caddy 設定 `keepalive_idle_conns_per_host`（API-3 收尾時決定）。
+   - **11/28 結果**：40 個並行都是 `200`，1 秒後、7 秒後都是 `200` → 維持 32，不設 `keepalive_idle_conns_per_host`。
+     `/health` 很快，40 個請求不一定同時在處理中，這次只證明正常流量不會被誤擋，沒有實際觸發上限。
 
 ### API-3b 部署紀錄
 
-部署後填寫（A-4 的三個指令）：
+2026-11-28 部署（A-4 的三個指令）：
 
 | 項目 | 值 |
 |---|---|
-| 部署 commit | （待填） |
-| Python | （待填） |
-| `pip freeze` | （待填；完整輸出另存 `docs/`，或貼在本節） |
+| 部署 commit | `3e69f84a0d053e95bc65553682e280e69e23aa8f` |
+| Python | 3.12.3（Ubuntu 系統 Python） |
+| venv 內的 pip | 24.0 → 升級為 26.3（24.0 有 6 個已知漏洞） |
+| `pip freeze` | 38 個套件，如下；11/28 以 `pip-audit` 檢查皆無已知漏洞 |
+
+```text
+aenum==3.1.17
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
+annotated-doc==0.0.7
+annotated-types==0.8.0
+anyio==4.16.0
+attrs==26.1.0
+certifi==2026.11.20
+charset-normalizer==3.5.3
+click==8.5.1
+Deprecated==3.0.1
+fastapi==0.165.0
+frozenlist==1.8.0
+future==1.0.0
+h11==0.16.0
+idna==3.20
+line-bot-sdk==3.27.0
+multidict==7.2.1
+numpy==2.5.5
+opentelemetry-api==1.45.2
+pandas==3.1.1
+propcache==0.5.4
+psycopg==3.3.9
+psycopg-binary==3.3.9
+psycopg-pool==3.3.3
+pydantic==2.14.4
+pydantic_core==2.50.5
+python-dateutil==2.9.0.post0
+requests==2.34.2
+six==1.17.0
+starlette==1.10.0
+typing-inspection==0.4.5
+typing_extensions==4.16.0
+urllib3==2.8.0
+uvicorn==0.54.0
+wrapt==2.5.2
+yarl==1.25.1
+```
+
+`pandas` 在 requirements 只寫 `>=2.2`，這次裝到 3.1.1（大版本 3）；API 不使用 pandas，擷取與轉換會用到。
+版本上限與 lock file 在 Demo 封板（12/6）一起處理。
 
 ### 更新程式（API）
 
 ```bash
 sudo git -C /opt/youbike-api pull --ff-only
+sudo /opt/youbike-api/.venv/bin/pip install --upgrade pip
 sudo /opt/youbike-api/.venv/bin/pip install -r /opt/youbike-api/requirements.txt
 sudo /opt/youbike-api/.venv/bin/python -m compileall -q /opt/youbike-api/src
 sudo systemctl restart youbike-api
 ```
 
 `/opt/youbike-api` 與 `/home/youbike/youbike-data-mvp` 是兩份 checkout，各自更新；`deploy/` 的設定檔以其中任一份安裝皆可，
-本節一律從 `/opt/youbike-api` 安裝。unit 檔有變更時需重新 `install`＋`daemon-reload`＋`restart`。
+本節一律從 `/opt/youbike-api` 安裝。unit 檔有變更時需重新 `install`＋`daemon-reload`＋`restart`；
+Caddyfile 有變更時照 A-7（先 validate repo 內的檔案，再覆蓋、validate、reload）。
 
 ### 回滾
 

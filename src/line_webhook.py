@@ -160,12 +160,16 @@ def build_echo_text(user_text: str) -> str:
 
 
 async def read_body_limited(request: Request, limit: int) -> bytes | None:
-    """邊讀邊累計 body 大小；超過 limit 時立刻停止讀取並回傳 None。"""
+    """邊讀邊累計 body 大小；超過 limit 時立刻停止讀取並回傳 None。
+
+    先檢查「已讀＋這一塊」是否超過 limit，再併入 body：超過時這一塊不會被複製進 body，
+    記憶體最多只有 limit 加上目前這一塊。
+    """
     body = bytearray()
     async for chunk in request.stream():
-        body += chunk
-        if len(body) > limit:
+        if len(body) + len(chunk) > limit:
             return None
+        body += chunk
     return bytes(body)
 
 

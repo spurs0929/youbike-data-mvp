@@ -408,6 +408,37 @@ def test_read_body_limited_stops_reading_once_over_limit():
     assert len(consumed) == 100
 
 
+def test_read_body_limited_rejects_single_oversized_chunk_without_copying(monkeypatch):
+    # 單一一塊就超過上限：要在併入 body 之前拒絕，不能先把整塊複製進去
+    import line_webhook
+
+    class FakeRequest:
+        async def stream(self):
+            yield b"x" * 10
+            yield b"y" * 100
+
+    sizes = []
+
+    class SpyBytearray(bytearray):
+        def __iadd__(self, other):
+            result = super().__iadd__(other)
+            sizes.append(len(self))
+            return result
+
+    monkeypatch.setattr(line_webhook, "bytearray", SpyBytearray, raising=False)
+    assert asyncio.run(read_body_limited(FakeRequest(), 50)) is None
+    assert sizes == [10]  # 只併入第 1 塊；100 bytes 那塊沒有被複製進 body
+
+
+def test_read_body_limited_accepts_exactly_limit():
+    class FakeRequest:
+        async def stream(self):
+            yield b"x" * 20
+            yield b"y" * 5
+
+    assert asyncio.run(read_body_limited(FakeRequest(), 25)) == b"x" * 20 + b"y" * 5
+
+
 # ================================================================ 日誌不含機密
 
 

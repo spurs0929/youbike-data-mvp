@@ -461,6 +461,35 @@ CLI 介面（使用者 11/22 確認）：
   常駐記憶體約 113 MB（Python 3.13）；回滾 SQL（`DROP OWNED BY`＋`DROP ROLE`）後可重建。`systemd-analyze verify` 只回報
   `/opt/youbike-api/.venv/bin/uvicorn` 不存在（預期）。Caddyfile 未在雲端驗證，API-3b 以 `caddy validate` 檢查。
 
+### API-3b：VM 部署（2026-11-28，部署 `3e69f84`）
+
+依 `deploy/README.md`〈API-3〉A-1～A-7 完成，外部驗收第 1～6、8 項通過；**公開 API（HTTPS）上線**：
+`https://youbike-data-mvp.duckdns.org`。Python 3.12.3、38 個套件（`pip freeze` 見 README〈API-3b 部署紀錄〉）。
+VM 實測：API `MemoryCurrent` 約 108.6 MiB（含檔案快取）；整機 available 449 MB、swap 110 MB。
+`--limit-concurrency 32` 維持、不設 Caddy `keepalive_idle_conns_per_host`（40 個並行請求沒有誤回 503）。
+
+發現：
+- 回應有 `Via: 1.1 Caddy`（reverse_proxy 加的）→ API-3 收尾刪除。
+- venv 內附 Ubuntu 的 pip 24.0，有 6 個已知漏洞 → 當場升級為 26.3；README 補上升級步驟。
+- 站名用「臺」，`q=台大` 0 筆、`q=臺大` 3 筆 → LINE-1 審閱時決定是否正規化。
+
+### API-3 收尾（2026-11-28）
+
+- **Caddyfile**：站台層加 `header -Via`。Caddy 以 `-` 刪除標頭時會延後到回應送出時才處理，所以刪得到 reverse_proxy 加上的標頭。
+- **`read_body_limited()`**：改成先檢查「已讀＋這一塊」再併入 body，超過上限的那一塊不會被複製進記憶體
+  （原本是先併入再檢查，單一 chunk 最大約 256 KiB，影響很小）。
+- **`deploy/api-db-role-check.sql`**：任一項為 `f`（或查詢失敗）時 psql 以結束代碼 3 結束，最後一行印出
+  `result | t/f | …`。檢查內容不變：每項查詢只加欄位別名，改以 `\gset` 存成 psql 變數再 `\echo` 印出；
+  `ON_ERROR_STOP` 寫在檔案內。以 PostgreSQL 16 實測：正常 0；授予 INSERT 時 `table_privileges | f` 且結束代碼 3；
+  角色不存在時結束代碼 3。
+- **README**：A-4、D0 安裝、兩處〈更新程式〉補上 `pip install --upgrade pip`；A-5 補上結束代碼與新的預期輸出；
+  A-7 改成先 validate repo 內的檔案，再覆蓋、validate、reload；填入〈API-3b 部署紀錄〉；驗收第 1、3 項加上「沒有 `Via`」。
+- **測試**（+4）：line_webhook 52 → 54（單一超大 chunk 不會被複製進 body、剛好等於上限可接受）；
+  deploy_api 37 → 39（站台層刪除 `Via`、權限檢查不通過時非零結束）；權限檢查 SQL 的「只含查詢」測試改為允許唯一一個只有
+  `RAISE EXCEPTION` 的 DO 區塊。突變測試：改回先併入再檢查、拿掉 `header -Via`、拿掉 `ON_ERROR_STOP`、總結少一項，各至少 1 項失敗。
+- **VM 收尾**（patch 推送後）：更新 Caddyfile、升級擷取用 venv 的 pip、驗收第 7 項（記憶體，與 4C 同時量）、
+  少量真實站點查詢的延遲／503 比例／記憶體峰值、`EXPLAIN ANALYZE`。結果另記。
+
 ---
 
 ## LINE Bot（`src/line_webhook.py`）
@@ -533,8 +562,7 @@ CLI 介面（使用者 11/22 確認）：
 
 12/11 必要功能：資料擷取、資料庫、API、LINE Bot、LLM Function Calling。
 
-1. **API-3b（部署）**：依 `deploy/README.md`〈API-3〉在 VM 安裝（API-3a 部署檔已完成）；
-   VM 上的記憶體與查詢計畫驗收。
+1. **API-3 收尾（VM）**：驗收第 7 項（記憶體）、真實查詢的延遲與 `EXPLAIN ANALYZE`（API-3b 已於 2026-11-28 上線）。
 2. **LINE Bot**：`webhookEventId` 冪等、定位查詢、固定指令；限流與額度（簽章驗證與文字回覆已在 LINE-0 完成）。
    個資處理（2026-11-23 決定）：
    - **migration `002` 建表時，LINE userId 一律存 HMAC 值、不存原始值**，並設定保存期限（期限與清理方式建表時決定）。

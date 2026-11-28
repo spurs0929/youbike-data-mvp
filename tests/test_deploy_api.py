@@ -165,6 +165,16 @@ def test_caddy_webhook_body_limit_and_server_header(caddy):
     assert "header -Server" in caddy
 
 
+def test_caddy_removes_via_header_at_site_level(caddy):
+    # reverse_proxy 會加「Via: 1.1 Caddy」；必須在站台層刪除，所有轉送路由都適用
+    site = re.search(
+        r"youbike-data-mvp\.duckdns\.org\s*\{(.*)\}\s*$", caddy, flags=re.DOTALL
+    )
+    assert site
+    before_first_matcher = site.group(1).split("@", 1)[0]
+    assert re.search(r"^\s*header -Via\s*$", before_first_matcher, flags=re.MULTILINE)
+
+
 def test_caddy_healthz_is_get_only(caddy):
     # 每個 handle 都要經具名 matcher（含 method），只有最後的預設 404 沒有條件
     assert "handle /" not in caddy
@@ -210,13 +220,49 @@ def test_role_defense_in_depth_settings(role_sql):
 # ================================================================ 權限檢查 SQL
 
 
-def test_role_check_sql_is_read_only():
-    # 檢查腳本只能查詢：每個敘述都以 SELECT 或 WITH 開頭
+def _role_check_statements() -> tuple[list[str], list[str]]:
+    """把檢查腳本切成（SQL 查詢, DO 區塊）。
+
+    DO 區塊（$$ … $$）內含分號，先整塊取出；其餘以分號與 psql 反斜線指令（\\gset、\\echo、\\if…）切割。
+    """
     text = _without_comments(_read("api-db-role-check.sql"), "--")
-    statements = [s.strip() for s in text.split(";") if s.strip()]
-    assert len(statements) == 8
-    for statement in statements:
+    blocks = re.findall(r"^DO \$\$.*?^\$\$;", text, flags=re.MULTILINE | re.DOTALL)
+    for block in blocks:
+        text = text.replace(block, "")
+    sql_lines = [
+        ";" if line.lstrip().startswith("\\") else line for line in text.splitlines()
+    ]
+    queries = [s.strip() for s in "\n".join(sql_lines).split(";") if s.strip()]
+    return queries, blocks
+
+
+def test_role_check_sql_is_read_only():
+    # 檢查腳本只能查詢：每個敘述都以 SELECT 或 WITH 開頭；
+    # 唯一的例外是不通過時讓 psql 非零結束的 DO 區塊，裡面只有 RAISE EXCEPTION
+    queries, blocks = _role_check_statements()
+    assert len(queries) == 9  # 7 項檢查＋info＋總結
+    for statement in queries:
         assert statement.split()[0].upper() in {"SELECT", "WITH"}, statement
+    assert len(blocks) == 1
+    body = " ".join(blocks[0].split())
+    assert re.fullmatch(r"DO \$\$ BEGIN RAISE EXCEPTION '[^']*'; END \$\$;", body), body
+
+
+def test_role_check_sql_exits_non_zero_when_any_check_fails():
+    text = _read("api-db-role-check.sql")
+    lines = [line.strip() for line in text.splitlines()]
+    # ON_ERROR_STOP 寫在檔案內，不依賴命令列的 -v ON_ERROR_STOP=1
+    assert "\\set ON_ERROR_STOP on" in lines
+    assert lines.index("\\set ON_ERROR_STOP on") < next(
+        i for i, line in enumerate(lines) if line.startswith("SELECT")
+    )
+    # 7 項檢查各自存進 c1_～c7_，總結要把 7 項全部 AND 起來
+    for n in range(1, 8):
+        assert f"\\gset c{n}_" in lines
+        assert f":'c{n}_ok'::boolean" in text
+    assert "\\if :all_ok" in lines
+    else_part = text[text.index("\\else") : text.index("\\endif")]
+    assert "RAISE EXCEPTION" in else_part
 
 
 def test_role_check_sql_covers_effective_privileges():

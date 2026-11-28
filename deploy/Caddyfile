@@ -23,8 +23,11 @@
 # - /ready（檢查資料庫）不對外，只在 VM 本機以 curl http://127.0.0.1:8000/ready 檢查。
 
 youbike-data-mvp.duckdns.org {
-	# 不回傳 Server 標頭（避免透露伺服器軟體）
+	# 不回傳 Server、Via 標頭（避免透露伺服器軟體）
+	# - Via：reverse_proxy 轉送時會在回應加上「Via: 1.1 Caddy」（API-3b 驗收時發現）。
+	# - 以 - 刪除標頭時，Caddy 會自動延後到回應送出時才處理，因此也刪得到 reverse_proxy 加上的標頭。
 	header -Server
+	header -Via
 
 	@healthz {
 		method GET
